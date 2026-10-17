@@ -1,0 +1,10 @@
+Smart Buildings Foundation Model Competition
+Copyright 2024-2026 The Smart Buildings Competition Authors.
+
+This project is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This work builds on the Smart Buildings Simulator ("smart_control" / sbsim),
+originally developed and open-sourced by Google, also under the Apache License,
+Version 2.0. The simulator components under
+`smart_buildings/smart_control/` are derived from that project. We gratefully
+acknowledge the original authors.

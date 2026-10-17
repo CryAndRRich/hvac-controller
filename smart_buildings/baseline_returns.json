@@ -1,0 +1,182 @@
+{
+  "building_train_1/atlanta_2": {
+    "bang_bang": -1521.123600285433,
+    "fixed_setpoint": -226.54133224006728,
+    "pid": -221.63060844315078,
+    "pid_water": -208.20547078879645
+  },
+  "building_train_1/denver_7": {
+    "bang_bang": -667.0259147151455,
+    "fixed_setpoint": -265.7422221327088,
+    "pid": -264.81174467093206,
+    "pid_water": -258.4793906195655
+  },
+  "building_train_1/fairbanks_1": {
+    "bang_bang": -2480.6730692398487,
+    "fixed_setpoint": -1274.3370816265524,
+    "pid": -1307.0561464700731,
+    "pid_water": -1828.9035575342423
+  },
+  "building_train_1/phoenix_5": {
+    "bang_bang": -2312.0761033286108,
+    "fixed_setpoint": -1119.0856497205677,
+    "pid": -1334.060819694696,
+    "pid_water": -1153.7718883943899
+  },
+  "building_train_1/singapore_8": {
+    "bang_bang": -2151.8554721112305,
+    "fixed_setpoint": -230.03273169799104,
+    "pid": -269.8912308801109,
+    "pid_water": -243.23388407597668
+  },
+  "building_train_2/atlanta_3": {
+    "bang_bang": -2197.68016190649,
+    "fixed_setpoint": -173.4145439799613,
+    "pid": -174.3497701983024,
+    "pid_water": -172.65914525010658
+  },
+  "building_train_2/denver_8": {
+    "bang_bang": -1782.9774064443473,
+    "fixed_setpoint": -820.0197139169904,
+    "pid": -591.6800780461381,
+    "pid_water": -343.6842219436385
+  },
+  "building_train_2/fairbanks_2": {
+    "bang_bang": -1603.0001924954413,
+    "fixed_setpoint": -850.7744004843989,
+    "pid": -806.0768162965214,
+    "pid_water": -689.567621762244
+  },
+  "building_train_2/phoenix_6": {
+    "bang_bang": -2536.1256021359154,
+    "fixed_setpoint": -1434.1609329137652,
+    "pid": -909.5388818592976,
+    "pid_water": -611.9813639851012
+  },
+  "building_train_2/singapore_1": {
+    "bang_bang": -2387.0359525032472,
+    "fixed_setpoint": -194.49638457559604,
+    "pid": -380.2157311819137,
+    "pid_water": -220.97255796444597
+  },
+  "building_train_4/atlanta_5": {
+    "bang_bang": -2159.840325841045,
+    "fixed_setpoint": -237.06985630671625,
+    "pid": -249.15797804955218,
+    "pid_water": -246.09202752732745
+  },
+  "building_train_4/denver_2": {
+    "bang_bang": -1307.672117187747,
+    "fixed_setpoint": -516.7686190446111,
+    "pid": -538.6404096550923,
+    "pid_water": -470.91149244279586
+  },
+  "building_train_4/fairbanks_4": {
+    "bang_bang": -1220.3635330546822,
+    "fixed_setpoint": -264.37772861250414,
+    "pid": -275.93898165453174,
+    "pid_water": -272.8497261964967
+  },
+  "building_train_4/phoenix_8": {
+    "bang_bang": -1314.132268779962,
+    "fixed_setpoint": -248.5439597835757,
+    "pid": -251.34978884572593,
+    "pid_water": -249.19310807158763
+  },
+  "building_train_4/singapore_3": {
+    "bang_bang": -2139.2931197565276,
+    "fixed_setpoint": -242.77693326624967,
+    "pid": -388.0022570386777,
+    "pid_water": -280.4680900068397
+  },
+  "building_train_5/atlanta_6": {
+    "bang_bang": -2544.417566827679,
+    "fixed_setpoint": -176.62602780643738,
+    "pid": -331.8283386600838,
+    "pid_water": -235.9095256853475
+  },
+  "building_train_5/denver_3": {
+    "bang_bang": -1601.6896062492633,
+    "fixed_setpoint": -1005.1657264800451,
+    "pid": -627.5287106633259,
+    "pid_water": -377.2483699281556
+  },
+  "building_train_5/fairbanks_5": {
+    "bang_bang": -1735.6530437519905,
+    "fixed_setpoint": -147.05764709862615,
+    "pid": -146.28287117198624,
+    "pid_water": -145.0307303881068
+  },
+  "building_train_5/phoenix_1": {
+    "bang_bang": -1145.9699900040705,
+    "fixed_setpoint": -322.4440529941121,
+    "pid": -386.5290114189402,
+    "pid_water": -287.2800934418565
+  },
+  "building_train_5/singapore_4": {
+    "bang_bang": -2614.5671045209347,
+    "fixed_setpoint": -205.94767632890307,
+    "pid": -1603.0336999930037,
+    "pid_water": -937.5886547335988
+  },
+  "building_train_7/atlanta_8": {
+    "bang_bang": -1765.9578466545572,
+    "fixed_setpoint": -549.1382637740917,
+    "pid": -643.8841595980612,
+    "pid_water": -416.95834617485343
+  },
+  "building_train_7/denver_5": {
+    "bang_bang": -2114.749044856462,
+    "fixed_setpoint": -1200.636057085927,
+    "pid": -371.8863025800879,
+    "pid_water": -311.7814880398123
+  },
+  "building_train_7/fairbanks_7": {
+    "bang_bang": -1610.6445096296375,
+    "fixed_setpoint": -615.0814339975914,
+    "pid": -681.5402987254638,
+    "pid_water": -464.1482945604612
+  },
+  "building_train_7/phoenix_3": {
+    "bang_bang": -2360.9457387775165,
+    "fixed_setpoint": -1381.7365955676978,
+    "pid": -437.4329010749087,
+    "pid_water": -383.5615453256977
+  },
+  "building_train_7/singapore_6": {
+    "bang_bang": -2316.8807518092513,
+    "fixed_setpoint": -225.33996955963312,
+    "pid": -381.2990941291764,
+    "pid_water": -268.6022983860212
+  },
+  "building_train_8/atlanta_1": {
+    "bang_bang": -1839.7383195048387,
+    "fixed_setpoint": -350.84994063635895,
+    "pid": -546.019640125669,
+    "pid_water": -280.38980270400134
+  },
+  "building_train_8/denver_6": {
+    "bang_bang": -2083.3991700533716,
+    "fixed_setpoint": -174.2009526490017,
+    "pid": -174.8353464761003,
+    "pid_water": -174.18797162599913
+  },
+  "building_train_8/fairbanks_8": {
+    "bang_bang": -1711.231069114896,
+    "fixed_setpoint": -698.3862662860774,
+    "pid": -694.7207413538417,
+    "pid_water": -667.2827985863423
+  },
+  "building_train_8/phoenix_4": {
+    "bang_bang": -2659.086436729599,
+    "fixed_setpoint": -1725.4731541005208,
+    "pid": -1605.3190570962915,
+    "pid_water": -1365.1872321021126
+  },
+  "building_train_8/singapore_7": {
+    "bang_bang": -2486.6890774311787,
+    "fixed_setpoint": -208.99569412207074,
+    "pid": -864.0769090653775,
+    "pid_water": -467.2933495677735
+  }
+}

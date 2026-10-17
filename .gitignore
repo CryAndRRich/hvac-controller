@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+.obsidian/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Evaluation outputs.
+#
+# A full sweep is a few hundred MB per policy, almost all of it charts and
+# per-step time series. None of it is tracked: a results tree is reproducible
+# by re-running evaluate.py, and keeping one in the repo would make the clone
+# large for no benefit.
+#
+# If you want to keep a sweep, keep reward_components.csv. Cost and carbon are
+# deterministic functions of the timestamp and linear in the energy rate, so
+# that one file lets a different normalisation be scored without re-simulating
+# anything.
+results/
+smart_buildings/results/
+
+# Holdout data must never enter this repo. These rules are a backstop in case a
+# generator is ever pointed at the default output path.
+smart_buildings/test_buildings/
+smart_buildings/test_scenarios/
+**/holdout*/
+**/test_set*/
+
+# Climate.OneBuilding weather work dir (hvac_controller/weather.py).
+weather_tmyx/
+
+# The 30 shipped scenarios (~100 MB of .npy). Rebuilt exactly by
+# `python -m smart_buildings.run_scenario_generator`; also in the Kaggle competition data.
+smart_buildings/training_scenarios/
