@@ -71,6 +71,7 @@ smart_buildings/
   check_scales.py           # assert reward denominators match c x K
 hvac_controller/            # our own code, kept apart from the starter kit
   weather.py                # fetch + pack Climate.OneBuilding TMYx weather; read it back on Kaggle
+  sim.py                    # load a fresh env; snapshot an env mid-episode (shares the LU factorization)
   probes.py                 # one-off checks the data pipeline depends on
 notebooks/                  # Kaggle notebooks only; each clones this repo and calls hvac_controller
   00_probe.ipynb            # runs probes.py

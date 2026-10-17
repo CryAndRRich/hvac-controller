@@ -18,9 +18,7 @@ All rollouts use the ``pid_water`` baseline so the plant runs as it would under 
 
 from __future__ import annotations
 
-import copy
 import os
-import pickle
 import platform
 import subprocess
 import sys
@@ -31,6 +29,7 @@ from pathlib import Path
 import numpy as np
 
 from hvac_controller import weather
+from hvac_controller.sim import load_env, snapshot
 from smart_buildings import evaluate
 from smart_buildings.smart_control.utils import scenario_generator as sg
 
@@ -50,14 +49,6 @@ EPOCH_2023 = np.datetime64("2023-01-01T00:00")
 
 
 # ---------------------------------------------------------------------------- helpers
-
-def load_env(config_gin: Path):
-    env = evaluate.load_hybrid_environment(Path(config_gin))
-    env.metrics_path = None
-    env._occupancy_normalization_constant = 125.0  # as evaluate.py sets it
-    meta = evaluate.create_building_meta_data(env, Path(config_gin).parent)
-    return env, meta
-
 
 def make_policy(env, meta):
     return evaluate.initialize_policy(evaluate.POLICY_MAP[POLICY], meta, env.action_spec())
@@ -187,20 +178,26 @@ def probe_snapshot(config_gin: Path, warm: int = 144, n: int = 144) -> dict:
     warm_run = rollout(env, policy, warm)
     out: dict = {"warm_steps": len(warm_run["reward"])}
     t0 = time.time()
-    env_copy, policy_copy = copy.deepcopy((env, policy))
+    env_copy, policy_copy = snapshot(env, policy)
     out["deepcopy_seconds"] = time.time() - t0
+    t0 = time.time()
+    env_copy2, policy_copy2 = snapshot(env, policy)
+    out["second_snapshot_seconds"] = time.time() - t0
+    # Size of what a snapshot copies (the shared factorization excluded), as a pickled estimate.
     try:
-        t0 = time.time()
-        blob = pickle.dumps((env, policy))
-        out["pickle_mb"] = len(blob) / 1e6
-        out["pickle_seconds"] = time.time() - t0
+        lu = env.building.simulator._solver._factorization if hasattr(env.building.simulator, "_solver") else None
+        out["shares_factorization"] = lu is not None and (
+            env_copy.building.simulator._solver._factorization is lu)
     except Exception as e:  # noqa: BLE001
-        out["pickle_error"] = f"{type(e).__name__}: {e}"
+        out["shares_factorization"] = f"{type(e).__name__}: {e}"
     obs = warm_run["last_obs"]
     a = rollout(env, policy, n, obs=obs)
     b = rollout(env_copy, policy_copy, n, obs=obs.copy())
+    c = rollout(env_copy2, policy_copy2, n, obs=obs.copy())
     out["original_vs_copy"] = max_diff(a, b)
     out["identical"] = bool(np.array_equal(a["obs"], b["obs"]) and np.array_equal(a["reward"], b["reward"]))
+    out["identical_second_copy"] = bool(np.array_equal(a["obs"], c["obs"]) and np.array_equal(a["reward"], c["reward"]))
+    out["branch_seconds_per_step"] = b["seconds"] / max(len(b["reward"]), 1)
     return out
 
 
@@ -210,7 +207,7 @@ def probe_ahu_off(config_gin: Path, warm: int = 144, n: int = 12) -> dict:
     policy = make_policy(env, meta)
     n_ahu = len(ahus(env))
     obs = rollout(env, policy, warm)["last_obs"]
-    env_b, policy_b = copy.deepcopy((env, policy))
+    env_b, policy_b = snapshot(env, policy)
     obs_b = obs.copy()
     log = {"on": [], "off": []}
     for _ in range(n):
