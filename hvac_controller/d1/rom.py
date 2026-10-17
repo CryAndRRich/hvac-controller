@@ -362,6 +362,30 @@ def modal_rom(red: dict, t_ref: float, n_zones: int, n_vavs: int, scales: np.nda
                      extra={"lambda": lam, "lambda_raw_min": lam_raw_min})
 
 
+def build_rom(core: Core, shifts=DEFAULT_SHIFTS, tol: float = 1e-6, log=None) -> LinearRom:
+    """The untruncated modal ROM of one core (step B's choice), with the exact outputs of the initial state."""
+    log = log or (lambda s: None)
+    t_ref = float(np.mean(core.temp0))
+    aug = Augmented(core)
+    f = aug.inputs()
+    x0 = aug.state0(t_ref)
+    basis, _ = build_basis(aug, f, x0, shifts, tol, log)
+    red = reduce(aug, basis, f, x0)
+    del basis
+    rom = modal_rom(red, t_ref, len(core.zone_names), core.applied.shape[1], np.ones(f.shape[1]))
+    rom.extra["y0"] = np.concatenate([core.sensed @ core.temp0, core.zones.T @ core.temp0])
+    rom.extra["h"] = core.h
+    return rom
+
+
+def load_rom(path: Path) -> LinearRom:
+    z = np.load(path)
+    extra = {k[len("extra_"):]: z[k] for k in z.files if k.startswith("extra_")}
+    return LinearRom(a=z["a"], b=z["b"], c=z["c"], d=z["d"], x0=z["x0"], t_ref=float(z["t_ref"]),
+                     n_zones=int(z["n_zones"]), n_vavs=int(z["n_vavs"]), scales=z["scales"], name=str(z["name"]),
+                     extra=extra)
+
+
 def modal_truncate(full: LinearRom, k: int) -> LinearRom:
     """Keep the k most dominant modes (DC contribution, scaled inputs); the rest become a DC feedthrough."""
     one_minus = 1.0 - full.a

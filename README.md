@@ -75,10 +75,17 @@ hvac_controller/            # our own code, kept apart from the starter kit
   probes.py                 # one-off checks the data pipeline depends on
   d1/core.py                # direction 1, step A: isolate the thermal core, replay it, save matrices for the ROM
   d1/rom.py                 # direction 1, step B: Krylov/Galerkin reduced model of the core, truncations, replay checks
+  d1/ops.py                 # direction 1, step C: one array namespace for NumPy and PyTorch
+  d1/spec.py                # step C: static building spec + exogenous series, read from the organisers' env
+  d1/plant.py               # step C: equipment, reward and observation as pure batched functions
+  d1/torch_env.py           # step C: BuildingEnv = ROM + plant, SHAC-style API, NumPy or PyTorch
+  d1/trace.py               # step C: ground-truth tracer for the organisers' env; structured random policy
+  d1/env_check.py           # step C: replica vs original, tiers T0-T5
 notebooks/                  # Kaggle notebooks only; each clones this repo and calls hvac_controller
   00_probe.ipynb            # runs probes.py
   10_d1_core_check.ipynb    # runs d1/core.py on three scenarios, swap off and on
   11_d1_rom_check.ipynb     # self-contained: baseline rollout + core (d1/core.py), then d1/rom.py, three scenarios in parallel
+  12_d1_env_check.ipynb     # runs d1/env_check.py: MODE debug (3 scenarios x 2 days) or gate (30 x 30 days, sharded)
 ```
 
 ## Install

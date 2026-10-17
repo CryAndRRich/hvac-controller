@@ -85,9 +85,29 @@ def core_step(solver, temp_solved, mass, q_solved, t_amb, h, g, ts):
     return solved, mass
 
 
+def core_from_env(env):
+    """The thermal core of a freshly reset environment (before its first step), as rom.Core; no rollout needed."""
+    from hvac_controller.d1.rom import Core
+
+    sim = env.building.simulator
+    s = solver_of(env)
+    h = float(sim._weather_controller.get_air_convection_coefficient(sim.current_timestamp))
+    zones, names = zone_spread_matrix(env)
+    return Core(
+        a=s.matrix(h).tocsc(), cap=s._capacitance_rate.copy(), amb=s._dirichlet_conductance + s.ambient_conductance(h),
+        mass_coupling=s._mass_coupling.copy(), mass_retained=s._mass_retained.copy(),
+        mass_gained=s._mass_gained.copy(), applied=s._applied.tocsc(), sensed=s._sensed.tocsr(), zones=zones,
+        temp0=np.asarray(grid_of(env).temp, dtype=np.float64).reshape(-1)[s._solved].copy(),
+        mass0=s._mass_temp.copy(), zone_names=names, h=h,
+    )
+
+
 class CoreRecorder:
-    def __init__(self, env):
+    """Wraps the solver's solve. verify=False only logs the per-step inputs and sensed outputs (no extra solves)."""
+
+    def __init__(self, env, verify: bool = True):
         self.env = env
+        self.verify = verify
         self.solver = solver_of(env)
         self.zones, self.zone_names = zone_spread_matrix(env)
         # Indicator of zone membership: summing a zone's CVs gives back its power (columns of U sum to one).
@@ -123,6 +143,15 @@ class CoreRecorder:
         out = self._original(temp, input_q, ambient_temperature, convection_coefficient,
                              air_side_conductance, supply_temperature)
         out_solved = np.asarray(out, dtype=np.float64).reshape(-1)[idx]
+        if not self.verify:
+            lg = self.log
+            lg["q_zone"].append(q_zone)
+            lg["g"].append(np.zeros(0) if g is None else g)
+            lg["ts"].append(np.zeros(0) if ts is None else ts)
+            lg["t_amb"].append(t_amb)
+            lg["h"].append(h)
+            lg["sensed_env"].append(self._sensed(out_solved))
+            return out
 
         if self._free is None:
             self._free = (temp_solved.copy(), mass_before.copy())
