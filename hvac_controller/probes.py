@@ -217,11 +217,13 @@ def probe_snapshot(config_gin: Path, warm: int = 144, n: int = 144) -> dict:
     return out
 
 
-def probe_ahu_off(config_gin: Path, max_warm: int = 2016, settle: int = 6, n: int = 24) -> dict:
-    """Branch at the same state: A keeps the baseline's commands, B forces every AHU off.
+def probe_ahu_off(config_gin: Path, max_warm: int = 2016, settle: int = 12, n: int = 24) -> dict:
+    """Is air still delivered when every AHU is commanded off?
 
-    The branch point is the first step where the building is occupied and every AHU has been running for ``settle``
-    steps (the shipped atlanta_2 starts on a Sunday, when the baseline keeps every AHU off).
+    Warm up with the baseline until the building has been occupied for ``settle`` steps, snapshot, then run both
+    branches on the same fixed action (every continuous setpoint at mid-range, pump on): A with every AHU on, B with
+    every AHU off. The baseline itself never runs all AHUs at once in atlanta_2's first week, so it cannot be the
+    branch policy.
     """
     env, meta = load_env(config_gin)
     policy = make_policy(env, meta)
@@ -229,24 +231,29 @@ def probe_ahu_off(config_gin: Path, max_warm: int = 2016, settle: int = 6, n: in
     occ = REWARD_FIELDS.index("total_occupancy")
     obs, _ = env.reset()
     obs = np.asarray(obs, dtype=np.float64)
-    running, warm = 0, 0
+    occupied, warm = 0, 0
     while warm < max_warm:
         obs, _, done = step(env, policy, obs)
         warm += 1
-        all_on = sum(plant_state(env)["ahu_run"]) == n_ahu and reward_parts(env)[occ] > 0
-        running = running + 1 if all_on else 0
-        if running >= settle or done:
+        occupied = occupied + 1 if reward_parts(env)[occ] > 0 else 0
+        if occupied >= settle or done:
             break
-    if running < settle:
-        return {"error": f"no occupied step with all {n_ahu} AHUs running within {max_warm} steps"}
+    if occupied < settle:
+        return {"error": f"building not occupied for {settle} steps within {max_warm} steps"}
     branch_at = str(env.building.current_timestamp)
-    env_b, policy_b = snapshot(env, policy)
-    obs_b = obs.copy()
+    env_b, _ = snapshot(env, policy)
+    spec = env.action_spec()
+    n_disc = int(spec["discrete_action"].shape[0])
+    cont = np.zeros(int(spec["continuous_action"].shape[0]), dtype=np.float32)
+    act_on = {"continuous_action": cont, "discrete_action": np.ones(n_disc, dtype=np.int32)}
+    disc_off = np.ones(n_disc, dtype=np.int32)
+    disc_off[:n_ahu] = 0  # AHUs first, the pump last
+    act_off = {"continuous_action": cont.copy(), "discrete_action": disc_off}
     log = {"on": [], "off": []}
     for _ in range(n):
-        obs, _, _ = step(env, policy, obs)
+        env.step({k: v.copy() for k, v in act_on.items()})
         log["on"].append({**plant_state(env), "reward": dict(zip(REWARD_FIELDS, reward_parts(env)))})
-        obs_b, _, _ = step(env_b, policy_b, obs_b, ahu_off=True, n_ahu=n_ahu)
+        env_b.step({k: v.copy() for k, v in act_off.items()})
         log["off"].append({**plant_state(env_b), "reward": dict(zip(REWARD_FIELDS, reward_parts(env_b)))})
 
     def mean(branch, key, sub=None):
@@ -259,7 +266,9 @@ def probe_ahu_off(config_gin: Path, max_warm: int = 2016, settle: int = 6, n: in
             "ahu_flow_sum": mean(b, "ahu_flow"),
             "vav_flow_demand_sum": mean(b, "vav_flow_demand_sum"),
             "vav_reheat_mean": mean(b, "vav_reheat_mean"),
+            "zone_temp_mean_first": log[b][0]["zone_temp_mean"],
             "zone_temp_mean_end": log[b][-1]["zone_temp_mean"],
+            "productivity_regret": mean(b, "reward", "normalized_productivity_regret"),
             "electricity_cost": mean(b, "reward", "electricity_energy_cost"),
             "gas_cost": mean(b, "reward", "natural_gas_energy_cost"),
         }
