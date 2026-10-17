@@ -569,13 +569,30 @@ def run_rom_check(core_dir: Path, out_dir: Path, shifts=DEFAULT_SHIFTS, orders=D
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("core_dir", type=Path)
     ap.add_argument("out_dir", type=Path)
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--core-dir", type=Path, help="a core saved by core.save_core")
+    src.add_argument("--config", type=Path,
+                     help="a scenario config.gin: roll the baseline with the step A recorder first and save its core")
+    ap.add_argument("--core-out", type=Path, help="where --config saves the core (default: OUT_DIR/core)")
+    ap.add_argument("--n-steps", type=int, default=1152, help="baseline steps logged with --config")
     ap.add_argument("--n-random", type=int, default=1152)
     ap.add_argument("--n-check", type=int, default=288)
     a = ap.parse_args()
-    run_rom_check(a.core_dir, a.out_dir, n_check=a.n_check, n_random=a.n_random,
-                  log=lambda s: print(s, flush=True))
+    log = lambda s: print(s, flush=True)  # noqa: E731
+    core_dir = a.core_dir
+    if a.config is not None:
+        from hvac_controller.d1.core import run_core_check  # needs the starter kit; only for --config
+
+        core_dir = a.core_out or a.out_dir / "core"
+        t0 = time.time()
+        log(f"[core] {a.config}: baseline rollout, {a.n_steps} steps, swap on")
+        rep = run_core_check(a.config, a.n_steps, swap=True, out_dir=core_dir)
+        a.out_dir.mkdir(parents=True, exist_ok=True)
+        (a.out_dir / "core_report.json").write_text(json.dumps(rep, indent=1))
+        log(f"[core] done in {time.time() - t0:.0f}s: one-step {rep['max_one_step_err_k']:.1e} K, "
+            f"swap effect {rep['free_run_max_err_k']} K")
+    run_rom_check(core_dir, a.out_dir, n_check=a.n_check, n_random=a.n_random, log=log)
 
 
 if __name__ == "__main__":
