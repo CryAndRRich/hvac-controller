@@ -6,8 +6,9 @@ The organisers' step (simulator_flexible_floor_plan.execute_step_sim) is: equipm
 
 ``CoreRecorder`` wraps the solver's ``solve`` on one environment. At every call it
 
-1. reduces ``input_q`` to one number per zone (heat is spread over a zone's diffusers with weights summing to one) and
-   checks that the per-zone numbers rebuild the field exactly;
+1. reduces ``input_q`` to one number per zone (Building.apply_thermal_power_zone spreads a zone's heat evenly over
+   every CV of the zone; only the VAV air stream lands on the diffusers, through the solver's ``_applied``) and checks
+   that the per-zone numbers rebuild the field exactly;
 2. re-runs the step with our own pure function from the environment's own start state (``one_step`` error: zero
    if we understand the core);
 3. advances a free-running replay that never sees the swap (``free_run`` error: the swap's accumulated effect on what
@@ -41,8 +42,11 @@ def grid_of(env):
     return env.building.simulator.building
 
 
-def zone_diffuser_matrix(env) -> tuple[scipy.sparse.csc_matrix, list[str]]:
-    """D (n_solved x n_zones): column z holds zone z's diffuser weights, indexed by solved position."""
+def zone_spread_matrix(env) -> tuple[scipy.sparse.csc_matrix, list[str]]:
+    """U (n_solved x n_zones): column z holds 1 / n_z on each of zone z's n_z CVs, indexed by solved position.
+
+    This is how apply_thermal_power_zone spreads a zone's heat (input_q[rows, cols] = power / rows.size).
+    """
     solver, grid = solver_of(env), grid_of(env)
     n_cells = grid.temp.size
     position = np.full(n_cells, -1, dtype=np.int64)
@@ -53,15 +57,12 @@ def zone_diffuser_matrix(env) -> tuple[scipy.sparse.csc_matrix, list[str]]:
         if name in NON_ZONES or not coords:
             continue
         r, c = np.transpose(np.asarray(coords))
-        w = grid.diffusers[r, c]
-        keep = w > 0.0
-        flat = r[keep] * n_cols + c[keep]
-        pos = position[flat]
+        pos = position[r * n_cols + c]
         if np.any(pos < 0):
-            raise ValueError(f"zone {name} has a diffuser on a pinned CV")
+            raise ValueError(f"zone {name} has a CV pinned to ambient")
         rows.append(pos)
         cols.append(np.full(len(pos), len(names)))
-        vals.append(w[keep])
+        vals.append(np.full(len(pos), 1.0 / len(pos)))
         names.append(name)
     d = scipy.sparse.csc_matrix(
         (np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
@@ -88,9 +89,9 @@ class CoreRecorder:
     def __init__(self, env):
         self.env = env
         self.solver = solver_of(env)
-        self.diffusers, self.zone_names = zone_diffuser_matrix(env)
-        # Column sums of D are one, so D^T maps a field back to per-zone power only if no CV is shared.
-        self._zone_index = self.diffusers.tocsr()
+        self.zones, self.zone_names = zone_spread_matrix(env)
+        # Indicator of zone membership: summing a zone's CVs gives back its power (columns of U sum to one).
+        self._member_t = self.zones.T.astype(bool).astype(np.float64).tocsr()
         self.log: dict[str, list] = {k: [] for k in (
             "q_zone", "g", "ts", "t_amb", "h", "sensed_env", "sensed_free",
             "one_step_err", "q_rebuild_err", "free_run_err")}
@@ -112,9 +113,8 @@ class CoreRecorder:
         temp_solved = np.asarray(temp, dtype=np.float64).reshape(-1)[idx].copy()
         mass_before = s._mass_temp.copy()
         q_field = np.asarray(input_q, dtype=np.float64).reshape(-1)[idx]
-        # Per-zone power: each zone's diffuser weights sum to one, so the power is the sum over its diffuser CVs.
-        q_zone = np.asarray(self.diffusers.T.astype(bool).astype(np.float64) @ q_field).ravel()
-        q_rebuilt = np.asarray(self.diffusers @ q_zone).ravel()
+        q_zone = np.asarray(self._member_t @ q_field).ravel()
+        q_rebuilt = np.asarray(self.zones @ q_zone).ravel()
         g = None if air_side_conductance is None else np.asarray(air_side_conductance, dtype=np.float64).copy()
         ts = None if supply_temperature is None else np.asarray(supply_temperature, dtype=np.float64).copy()
         h = float(convection_coefficient)
@@ -204,7 +204,7 @@ def save_core(env, rec: CoreRecorder, a: dict[str, np.ndarray], out_dir: Path) -
     scipy.sparse.save_npz(out_dir / "matrix.npz", s.matrix(h).tocsc())
     scipy.sparse.save_npz(out_dir / "applied.npz", s._applied.tocsc())
     scipy.sparse.save_npz(out_dir / "sensed.npz", s._sensed.tocsr())
-    scipy.sparse.save_npz(out_dir / "diffusers.npz", rec.diffusers.tocsc())
+    scipy.sparse.save_npz(out_dir / "zones.npz", rec.zones.tocsc())
     np.savez_compressed(
         out_dir / "vectors.npz",
         solved=s._solved, shape=np.array(s._shape), h=np.array(h),
