@@ -73,8 +73,10 @@ hvac_controller/            # our own code, kept apart from the starter kit
   weather.py                # fetch + pack Climate.OneBuilding TMYx weather; read it back on Kaggle
   sim.py                    # load a fresh env; snapshot an env mid-episode (shares the LU factorization)
   probes.py                 # one-off checks the data pipeline depends on
+  d1/core.py                # direction 1, step A: isolate the thermal core, replay it, save matrices for the ROM
 notebooks/                  # Kaggle notebooks only; each clones this repo and calls hvac_controller
   00_probe.ipynb            # runs probes.py
+  10_d1_core_check.ipynb    # runs d1/core.py on three scenarios, swap off and on
 ```
 
 ## Install

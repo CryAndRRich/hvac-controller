@@ -5,18 +5,30 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 
+import gin
 import numpy as np
 
 from smart_buildings import evaluate
+from smart_buildings.smart_control.environment import hybrid_action_environment
 
 
-def load_env(config_gin: Path):
+def load_env(config_gin: Path, gin_overrides: dict | None = None):
     """A fresh environment and its policy metadata.
 
     Build a fresh one per episode: ``env.reset()`` does not restore every internal state (probe 2026-10-17:
     two rollouts after reset diverge from step 3, while two fresh environments are bit-identical).
+    ``gin_overrides`` binds extra parameters after the scenario's config, e.g.
+    ``{"StochasticConvectionSimulator.p": 0.0}`` switches the intra-room mixing swap off.
     """
-    env = evaluate.load_hybrid_environment(Path(config_gin))
+    if gin_overrides:
+        gin.clear_config()
+        with gin.unlock_config():
+            gin.parse_config_file(str(config_gin))
+            for key, value in gin_overrides.items():
+                gin.bind_parameter(key, value)
+        env = hybrid_action_environment.HybridActionEnvironment()
+    else:
+        env = evaluate.load_hybrid_environment(Path(config_gin))
     env.metrics_path = None
     env._occupancy_normalization_constant = 125.0  # as evaluate.py sets it
     meta = evaluate.create_building_meta_data(env, Path(config_gin).parent)
