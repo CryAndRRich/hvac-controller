@@ -74,9 +74,11 @@ hvac_controller/            # our own code, kept apart from the starter kit
   sim.py                    # load a fresh env; snapshot an env mid-episode (shares the LU factorization)
   probes.py                 # one-off checks the data pipeline depends on
   d1/core.py                # direction 1, step A: isolate the thermal core, replay it, save matrices for the ROM
+  d1/rom.py                 # direction 1, step B: Krylov/Galerkin reduced model of the core, truncations, replay checks
 notebooks/                  # Kaggle notebooks only; each clones this repo and calls hvac_controller
   00_probe.ipynb            # runs probes.py
   10_d1_core_check.ipynb    # runs d1/core.py on three scenarios, swap off and on
+  11_d1_rom_check.ipynb     # runs d1/rom.py on notebook 10's saved cores (attach its output)
 ```
 
 ## Install
