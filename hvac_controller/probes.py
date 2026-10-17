@@ -104,15 +104,30 @@ def rollout(env, policy, n: int, obs=None) -> dict:
             "seconds": time.time() - t0, "last_obs": obs}
 
 
-def max_diff(a: dict, b: dict) -> dict:
+def field_diff(a: dict, b: dict, names: list[str], top: int = 8) -> list[dict]:
+    """The observation fields that differ most between two rollouts, with the first step each differs."""
+    n = min(len(a["obs"]), len(b["obs"]))
+    if not n:
+        return []
+    d = np.abs(a["obs"][:n] - b["obs"][:n])
+    worst = np.argsort(-d.max(axis=0))[:top]
+    return [{"field": names[j] if j < len(names) else str(j), "max_abs": float(d[:, j].max()),
+             "first_step": int(np.argmax(d[:, j] > 0))} for j in worst if d[:, j].max() > 0]
+
+
+def max_diff(a: dict, b: dict, names: list[str] | None = None) -> dict:
     n = min(len(a["reward"]), len(b["reward"]))
-    return {
+    out = {
         "steps_compared": n,
         "obs": float(np.max(np.abs(a["obs"][:n] - b["obs"][:n]))) if n else None,
         "reward": float(np.max(np.abs(a["reward"][:n] - b["reward"][:n]))) if n else None,
         "first_obs_diff_step": int(np.argmax(np.any(a["obs"][:n] != b["obs"][:n], axis=1)))
         if n and np.any(a["obs"][:n] != b["obs"][:n]) else None,
+        "n_fields_differing": int(np.sum(np.any(a["obs"][:n] != b["obs"][:n], axis=0))) if n else 0,
     }
+    if names is not None:
+        out["fields"] = field_diff(a, b, names)
+    return out
 
 
 # ---------------------------------------------------------------------------- probes
@@ -164,9 +179,10 @@ def probe_determinism(config_gin: Path, n: int = 288) -> dict:
     b = rollout(env, make_policy(env, meta), n)  # same env, after reset
     env2, meta2 = load_env(config_gin)
     c = rollout(env2, make_policy(env2, meta2), n)  # fresh env
+    names = meta["observation_field_names"]
     return {
-        "same_env_after_reset": max_diff(a, b),
-        "fresh_env": max_diff(a, c),
+        "same_env_after_reset": max_diff(a, b, names),
+        "fresh_env": max_diff(a, c, names),
         "identical_after_reset": bool(np.array_equal(a["obs"], b["obs"]) and np.array_equal(a["reward"], b["reward"])),
         "identical_fresh_env": bool(np.array_equal(a["obs"], c["obs"]) and np.array_equal(a["reward"], c["reward"])),
     }
@@ -194,19 +210,36 @@ def probe_snapshot(config_gin: Path, warm: int = 144, n: int = 144) -> dict:
     a = rollout(env, policy, n, obs=obs)
     b = rollout(env_copy, policy_copy, n, obs=obs.copy())
     c = rollout(env_copy2, policy_copy2, n, obs=obs.copy())
-    out["original_vs_copy"] = max_diff(a, b)
+    out["original_vs_copy"] = max_diff(a, b, meta["observation_field_names"])
     out["identical"] = bool(np.array_equal(a["obs"], b["obs"]) and np.array_equal(a["reward"], b["reward"]))
     out["identical_second_copy"] = bool(np.array_equal(a["obs"], c["obs"]) and np.array_equal(a["reward"], c["reward"]))
     out["branch_seconds_per_step"] = b["seconds"] / max(len(b["reward"]), 1)
     return out
 
 
-def probe_ahu_off(config_gin: Path, warm: int = 144, n: int = 12) -> dict:
-    """Branch at the same state: A keeps the baseline's commands, B forces every AHU off."""
+def probe_ahu_off(config_gin: Path, max_warm: int = 2016, settle: int = 6, n: int = 24) -> dict:
+    """Branch at the same state: A keeps the baseline's commands, B forces every AHU off.
+
+    The branch point is the first step where the building is occupied and every AHU has been running for ``settle``
+    steps (the shipped atlanta_2 starts on a Sunday, when the baseline keeps every AHU off).
+    """
     env, meta = load_env(config_gin)
     policy = make_policy(env, meta)
     n_ahu = len(ahus(env))
-    obs = rollout(env, policy, warm)["last_obs"]
+    occ = REWARD_FIELDS.index("total_occupancy")
+    obs, _ = env.reset()
+    obs = np.asarray(obs, dtype=np.float64)
+    running, warm = 0, 0
+    while warm < max_warm:
+        obs, _, done = step(env, policy, obs)
+        warm += 1
+        all_on = sum(plant_state(env)["ahu_run"]) == n_ahu and reward_parts(env)[occ] > 0
+        running = running + 1 if all_on else 0
+        if running >= settle or done:
+            break
+    if running < settle:
+        return {"error": f"no occupied step with all {n_ahu} AHUs running within {max_warm} steps"}
+    branch_at = str(env.building.current_timestamp)
     env_b, policy_b = snapshot(env, policy)
     obs_b = obs.copy()
     log = {"on": [], "off": []}
@@ -232,7 +265,8 @@ def probe_ahu_off(config_gin: Path, warm: int = 144, n: int = 12) -> dict:
         }
         for b in ("on", "off")
     }
-    return {"warm_steps": warm, "branch_steps": n, "n_ahu": n_ahu, "summary": summary, "log": log}
+    return {"warm_steps": warm, "branch_at": branch_at, "branch_steps": n, "n_ahu": n_ahu, "summary": summary,
+            "log": log}
 
 
 def probe_generator(repo_dir: Path, shipped_scenarios: Path, out_dir: Path,
