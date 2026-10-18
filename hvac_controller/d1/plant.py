@@ -109,6 +109,15 @@ class Plant:
         self.obs_zero = o.asarray([(not p) and s <= 0.0 for p, s in zip(plain, std)]) > 0.5
         self.n_obs = len(gather)
 
+    def max_air_conductance(self) -> np.ndarray:
+        """Upper bound of g = flow * rho * c_p per VAV over every valid action: full damper, the highest static
+        pressure the action range allows (1 % over it: the organisers reject actions beyond a 1e-5 tolerance), and
+        no AHU capacity cap."""
+        sp = self.spec
+        p_max = 1.01 * max(max(row[5] for row in sp.cont if row[0] == "ahu_p"), float(np.max(sp.ahu["min_pressure"])))
+        flow = sp.vav["max_flow"] * np.sqrt(p_max / sp.vav["design_pressure"])
+        return sp.phys["air_rho"] * sp.phys["air_cp"] * flow
+
     # ------------------------------------------------------------------------------------------------- helpers
     def _r32(self, x):
         return self.o.round_f32(x) if self.f32 else x

@@ -4,14 +4,16 @@ For one scenario, after building the replica once (torch_env.replica_from_env):
 
 1. setup: seconds to load the environment and build the spec, the ROM and the exogenous series;
 2. accuracy: structured random actions (trace.ExcitePolicy, one seed per batch row) for the whole episode on the
-   NumPy float64 replica (validated against the original in step C) against torch float64 and float32 on the
-   device; and batch rows against a single run with the same actions (batch independence);
+   NumPy float64 replica with the exact LU air solve (as validated against the original in step C) against torch
+   float64 and float32 on the device with the default (Jacobi) air solve; and batch rows against a single run with
+   the same actions (batch independence);
 3. forward: steps per second without gradients at each batch size, eager and, if asked, torch.compile'd;
 4. forward + backward: gradient windows of h steps on the relaxed plant (exact=False), loss = summed reward,
    actions as leaf tensors; env-steps per second, peak device memory, finite gradients;
-5. breakdown: device time of the ROM step (and of its V x V solve alone), plant.pre and plant.post at one batch size;
-   and how diagonal the air-side system (I + G M) p = G r is, i.e. whether a few Jacobi sweeps (batched matvecs)
-   could replace the LU solve.
+5. breakdown: device time of the ROM step (and of its air solve, Jacobi against LU), plant.pre and plant.post at one
+   batch size; and the Jacobi spectral radius actually met, against the bound the sweep count is set from;
+6. compile diagnostics (with --compile): one gradient window compiled with aot_eager (no Inductor) and with Inductor,
+   against eager: rewards, and which gradients are non-finite where.
 
 Compiled runs reset dynamo before each environment: the cache is per code object, so every new environment
 recompiles ``_advance``, and past the recompile limit torch would quietly fall back to eager.
@@ -37,19 +39,27 @@ from hvac_controller.sim import load_env
 
 ACC_ROWS = 8  # action sequences compared with the NumPy reference
 ACC_BATCH = 64  # batch the device runs them in (rows ACC_ROWS.. are other seeds)
-# Inductor settings tried for the compiled backward (the default failed in Triton on a T4, torch 2.11, 2026-10-18).
-COMPILE_VARIANTS = {"compiled": {}, "compiled_no_persistent": {"triton.persistent_reductions": False}}
+# Inductor settings tried for the compiled backward. On a T4, torch 2.11 (2026-10-18) the default failed in Triton and
+# persistent reductions off compiled on two of three buildings but gave non-finite gradients.
+NO_PERSISTENT = {"triton.persistent_reductions": False}
+COMPILE_VARIANTS = {"compiled": {}, "compiled_no_persistent": NO_PERSISTENT}
 
 
 def _failure(e: Exception) -> dict:
     return {"error": f"{type(e).__name__}: {str(e)[:300]}", "detail": traceback.format_exc()[-6000:]}
 
 
-def _new_env(spec, rom, exo, B: int, device: str, compile_step: bool, **kw) -> BuildingEnv:
-    if compile_step:
+def _new_env(spec, rom, exo, B: int, device: str, backend: str | None = None, **kw) -> BuildingEnv:
+    if backend:
         torch._dynamo.reset()
     return BuildingEnv(spec, rom, exo, B, Ops("torch", dtype=torch.float32, device=device), emulate_f32=False,
-                       compile_step=compile_step, **kw)
+                       compile_backend=backend, **kw)
+
+
+def _inductor_patch(opts: dict):
+    import torch._inductor.config as inductor_config
+
+    return inductor_config.patch(opts) if opts else contextlib.nullcontext()
 
 
 def _sync(device: str) -> None:
@@ -89,7 +99,8 @@ def _compare(run: dict, ref: dict, rows: int) -> dict:
 def check_accuracy(spec, rom, exo, action_spec, device: str, n_steps: int, log=print) -> dict:
     a_c, a_d = excite_actions(action_spec, n_steps, ACC_BATCH)
     t0 = time.time()
-    ref = _rollout(BuildingEnv(spec, rom, exo, ACC_ROWS, Ops("numpy")), a_c[:, :ACC_ROWS], a_d[:, :ACC_ROWS], ACC_ROWS)
+    ref = _rollout(BuildingEnv(spec, rom, exo, ACC_ROWS, Ops("numpy"), air_solve="lu"), a_c[:, :ACC_ROWS],
+                   a_d[:, :ACC_ROWS], ACC_ROWS)
     out = {"steps": n_steps, "rows": ACC_ROWS, "batch": ACC_BATCH, "numpy_s": time.time() - t0}
     runs = {}
     for name, dtype, f32 in (("float64", torch.float64, True), ("float32", torch.float32, False)):
@@ -97,9 +108,9 @@ def check_accuracy(spec, rom, exo, action_spec, device: str, n_steps: int, log=p
         env = BuildingEnv(spec, rom, exo, ACC_BATCH, Ops("torch", dtype=dtype, device=device), emulate_f32=f32)
         with torch.no_grad():
             runs[name] = _rollout(env, a_c, a_d, ACC_ROWS)
-        out[name] = {**_compare(runs[name], ref, ACC_ROWS), "seconds": time.time() - t0}
+        out[name] = {**_compare(runs[name], ref, ACC_ROWS), "seconds": time.time() - t0, "sweeps": env.rom.sweeps}
         log(f"  accuracy {name}: zone max {out[name]['zone_max_k']:.2e} K, reward sum {out[name]['reward_sum_rel_max']:.2e}")
-    env = _new_env(spec, rom, exo, 1, device, False)
+    env = _new_env(spec, rom, exo, 1, device)
     with torch.no_grad():
         single = _rollout(env, a_c[:, :1], a_d[:, :1], 1)
     out["batch_independence_float32"] = _compare(single, runs["float32"], 1)
@@ -115,11 +126,11 @@ def _random_actions(B: int, n_c: int, n_d: int, device: str, n: int = 16):
     return a_c, a_d
 
 
-def forward_speed(spec, rom, exo, device: str, batches, n_steps: int = 288, compile_step: bool = False) -> dict:
+def forward_speed(spec, rom, exo, device: str, batches, n_steps: int = 288, backend: str | None = None) -> dict:
     out = {}
     for B in batches:
         try:
-            env = _new_env(spec, rom, exo, B, device, compile_step)
+            env = _new_env(spec, rom, exo, B, device, backend)
             a_c, a_d = _random_actions(B, len(spec.cont), len(spec.disc), device)
             with torch.no_grad():
                 env.reset()
@@ -143,10 +154,10 @@ def forward_speed(spec, rom, exo, device: str, batches, n_steps: int = 288, comp
     return out
 
 
-def _backward_once(spec, rom, exo, device: str, B: int, h: int, n_windows: int, compile_step: bool) -> dict:
+def _backward_once(spec, rom, exo, device: str, B: int, h: int, n_windows: int, backend: str | None) -> dict:
     """n_windows timed gradient windows after one warm-up window (which also compiles)."""
     cuda = device.startswith("cuda")
-    env = _new_env(spec, rom, exo, B, device, compile_step, exact=False)
+    env = _new_env(spec, rom, exo, B, device, backend, exact=False)
     env.reset()
     if cuda:
         torch.cuda.reset_peak_memory_stats()
@@ -172,12 +183,12 @@ def _backward_once(spec, rom, exo, device: str, B: int, h: int, n_windows: int, 
 
 
 def backward_speed(spec, rom, exo, device: str, batches, windows, n_windows: int = 3,
-                   compile_step: bool = False) -> dict:
+                   backend: str | None = None) -> dict:
     out = {}
     for h in windows:
         for B in batches:
             try:  # in its own frame, so an out-of-memory window releases its graph with the frame
-                out[f"h{h}_B{B}"] = _backward_once(spec, rom, exo, device, B, h, n_windows, compile_step)
+                out[f"h{h}_B{B}"] = _backward_once(spec, rom, exo, device, B, h, n_windows, backend)
             except Exception as e:
                 out[f"h{h}_B{B}"] = {"h": h, "B": B, **_failure(e)}
             if device.startswith("cuda"):
@@ -196,17 +207,14 @@ def _timeit(fn, device: str, n: int = 50) -> float:
     return (time.time() - t0) / n * 1e3
 
 
-def solve_diagnostics(spec, rom, g_rows: np.ndarray) -> dict:
+def solve_diagnostics(rom, g_rows: np.ndarray, g_full: np.ndarray) -> dict:
     """How far (I + G M) p = G r is from diagonal. Jacobi converges iff rho(D^-1 G M_off) < 1, D = I + diag(G M).
 
-    Rows: the air conductances of a running batch, and every VAV at full damper and the highest static pressure.
+    Rows: the air conductances of a running batch, and g_full (Plant.max_air_conductance, every VAV at its maximum).
     """
     m = rom._m
     d = np.diag(m)
     off = m - np.diag(d)
-    p_hi = max(row[5] for row in spec.cont if row[0] == "ahu_p")
-    ph = spec.phys
-    g_full = ph["air_rho"] * ph["air_cp"] * spec.vav["max_flow"] * np.sqrt(p_hi / spec.vav["design_pressure"])
     rho, inf = [], []
     for g in np.vstack([g_rows, g_full[None]]):
         j = (g / (1.0 + g * d))[:, None] * off
@@ -220,7 +228,7 @@ def solve_diagnostics(spec, rom, g_rows: np.ndarray) -> dict:
 
 def breakdown(spec, rom, exo, device: str, B: int) -> dict:
     """Milliseconds per call of each part of one step, on the state after a few steps."""
-    env = _new_env(spec, rom, exo, B, device, False)
+    env = _new_env(spec, rom, exo, B, device)
     a_c, a_d = _random_actions(B, len(spec.cont), len(spec.disc), device)
     pl, tr, o = env.plant, env.rom, env.o
     with torch.no_grad():
@@ -233,8 +241,8 @@ def breakdown(spec, rom, exo, device: str, B: int) -> dict:
         dev = pl.decode(a_c[0], a_d[0])
         aux = pl.pre(s["y"], s["tank"], dev, t_amb, ones * e["comfort"], ones[:, None] * e["occ_step"])
         _, y_new = tr.step(s["x"], aux["q_zone"], t_amb, aux["g"], aux["ts"])
-        lhs = tr.eye + aux["g"][:, :, None] * tr.m
-        rhs = aux["g"] * (aux["ts"] - tr.t_ref)
+        g, r = aux["g"], aux["ts"] - tr.t_ref - tr.pre_air(s["x"], aux["q_zone"], t_amb)[1][:, :tr.V]
+        lhs = tr.eye + g[:, :, None] * tr.m
 
         def post():
             return pl.post(y_new, s["ret"], dev, aux, ones * e["t_amb_next"], ones[:, None] * e["win_now"],
@@ -248,10 +256,56 @@ def breakdown(spec, rom, exo, device: str, B: int) -> dict:
                 "pre_ms": _timeit(lambda: pl.pre(s["y"], s["tank"], dev, t_amb, ones * e["comfort"],
                                                  ones[:, None] * e["occ_step"]), device),
                 "rom_ms": _timeit(lambda: tr.step(s["x"], aux["q_zone"], t_amb, aux["g"], aux["ts"]), device),
-                "solve_ms": _timeit(lambda: o.solve(lhs, rhs), device),
-                "bmm_ms": _timeit(lambda: torch.bmm(lhs, rhs.unsqueeze(-1)), device),  # one Jacobi sweep's matvec
+                "air_ms": _timeit(lambda: tr.air_power(g, r), device),
+                "lu_ms": _timeit(lambda: o.solve(lhs, g * r), device),
+                "air_vs_lu_rel": float((tr.air_power(g, r) - o.solve(lhs, g * r)).abs().max()
+                                       / o.solve(lhs, g * r).abs().max()),
                 "post_ms": _timeit(post, device),
-                "solve_diag": solve_diagnostics(spec, rom, o.to_numpy(aux["g"][:64]))}
+                "sweeps": tr.sweeps, "q_bound": tr.q,
+                "solve_diag": solve_diagnostics(rom, o.to_numpy(g[:64]), pl.max_air_conductance())}
+
+
+def compile_diagnostics(spec, rom, exo, device: str, B: int = 64, h: int = 8) -> dict:
+    """One identical gradient window, eager against compiled: where do the compiled gradients go non-finite?
+
+    aot_eager traces and decomposes like Inductor but runs the decomposed ops eagerly, so a failure there is in the
+    graph and its decompositions, a failure only under Inductor is in the generated kernels.
+    """
+    a_c0, a_d0 = _random_actions(B, len(spec.cont), len(spec.disc), device, n=h)
+    names = [f"{row[0]}[{row[1]}]" for row in spec.cont]
+
+    def window(backend):
+        env = _new_env(spec, rom, exo, B, device, backend, exact=False)
+        env.reset()
+        a_c = (a_c0 * 0.9).requires_grad_(True)
+        a_d = a_d0.clamp(0.05, 0.95).requires_grad_(True)
+        rewards, total = [], 0.0
+        for k in range(h):
+            _, r, _, _ = env.step(a_c[k], a_d[k])
+            rewards.append(r.detach())
+            total = total + r.sum()
+        total.backward()
+        return torch.stack(rewards), a_c.grad, a_d.grad
+
+    rew0, gc0, gd0 = window(None)
+    out = {"B": B, "h": h, "eager_grad_finite": bool(torch.isfinite(gc0).all() and torch.isfinite(gd0).all())}
+    for name, backend, opts in (("aot_eager", "aot_eager", {}), ("inductor_no_persistent", "inductor", NO_PERSISTENT)):
+        try:
+            with _inductor_patch(opts):
+                rew, gc, gd = window(backend)
+            bad = ~torch.isfinite(gc)
+            both = torch.isfinite(gc) & torch.isfinite(gc0)
+            steps_bad = bad.flatten(1).any(1)
+            out[name] = {
+                "reward_max_abs_diff": float((rew - rew0).abs().max()), "reward_finite": bool(torch.isfinite(rew).all()),
+                "grad_cont_nonfinite": int(bad.sum()), "grad_disc_nonfinite": int((~torch.isfinite(gd)).sum()),
+                "steps_with_nonfinite": [int(k) for k in torch.nonzero(steps_bad).flatten()],
+                "actions_with_nonfinite": [names[j] for j in torch.nonzero(bad.flatten(0, 1).any(0)).flatten()][:20],
+                "grad_cont_max_abs_diff_finite": float((gc - gc0)[both].abs().max()) if both.any() else None,
+                "grad_cont_scale": float(gc0.abs().max())}
+        except Exception as e:
+            out[name] = _failure(e)
+    return out
 
 
 def run_bench(config_gin: Path, out_dir: Path, device: str, batches, windows, back_batches, n_steps: int,
@@ -288,16 +342,17 @@ def run_bench(config_gin: Path, out_dir: Path, device: str, batches, windows, ba
     log(f"  breakdown B1024: {report['breakdown']}")
     save()
     if compile_step:
-        report["forward_compiled"] = forward_speed(spec, rom, exo, device, batches, compile_step=True)
+        report["compile_diagnostics"] = compile_diagnostics(spec, rom, exo, device)
+        log(f"  compile diagnostics: {json.dumps(report['compile_diagnostics'], default=str)[:1500]}")
+        save()
+        report["forward_compiled"] = forward_speed(spec, rom, exo, device, batches, backend="inductor")
         log("  forward compiled " + " ".join(f"B{b}:{v.get('env_steps_per_s', 0):.0f}/s"
                                             for b, v in report["forward_compiled"].items()))
         save()
-        import torch._inductor.config as inductor_config
-
         for name, opts in COMPILE_VARIANTS.items():
             try:  # an unknown config key must not end the bench
-                with inductor_config.patch(opts) if opts else contextlib.nullcontext():
-                    res = backward_speed(spec, rom, exo, device, back_batches, windows[:1], compile_step=True)
+                with _inductor_patch(opts):
+                    res = backward_speed(spec, rom, exo, device, back_batches, windows[:1], backend="inductor")
             except Exception as e:
                 res = {"setup": _failure(e)}
             report[f"backward_{name}"] = res

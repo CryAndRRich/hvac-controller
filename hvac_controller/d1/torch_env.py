@@ -3,7 +3,8 @@
 ``BuildingEnv`` follows the batched interface SHAC-style learners use (DiffRL, rewarped): ``num_envs``, ``num_obs``,
 ``num_actions``, ``reset``, ``step(action) -> obs, reward, done, extras`` and ``clear_grad`` (cut the graph between
 windows). The action is the competition's hybrid action: continuous values in [-1, 1] and discrete run commands in
-{0, 1} (any value in [0, 1] when ``exact=False``).
+{0, 1} (any value in [0, 1] when ``exact=False``). Continuous values must stay in [-1, 1], as the organisers require:
+the air solve's sweep count relies on it.
 
 One environment holds one building (one ROM). Its batch runs B copies of it, each with its own actions; the
 exogenous series is shared and every copy sits at the same step. With the NumPy backend it is the validation
@@ -15,6 +16,7 @@ replica that env_check compares with the organisers' simulator.
 from __future__ import annotations
 
 import copy
+import math
 import time
 
 import numpy as np
@@ -48,9 +50,18 @@ def replica_from_env(env, n_steps: int, log=None) -> tuple[BuildingSpec, LinearR
 
 
 class ThermalRom:
-    """LinearRom.step for a batch: x' = a * x + B w, y' = C x', with the VAV air power solved implicitly."""
+    """LinearRom.step for a batch: x' = a * x + B w, y' = C x', with the VAV air power solved implicitly.
 
-    def __init__(self, rom: LinearRom, ops: Ops):
+    The air power solves (I + G M) p = G r, G = diag(g). M (V x V) is nearly diagonal: within one step a VAV's air
+    barely reaches the sensors of other zones. So, unless ``air_solve="lu"``, it is solved by Jacobi sweeps
+    p <- D^-1 G (r - M_off p), D = I + diag(g * m_ii), whose error contracts by ||D^-1 G M_off||_inf
+    <= q = max_i g_i / (1 + g_i m_ii) * sum_j |m_ij|. That grows with every g_i, so q is taken at ``g_max``, the
+    largest conductance any valid action gives (or g -> inf, 1 / m_ii, without it). The number of sweeps is fixed
+    from q and the dtype, so the result is within 1e-8 (float32) or 1e-15 (float64) of the exact solve for every
+    valid action, with no device sync. If q >= 0.5 it falls back to the batched LU solve.
+    """
+
+    def __init__(self, rom: LinearRom, ops: Ops, air_solve: str = "auto", g_max: np.ndarray | None = None):
         o = ops
         Z, V = rom.n_zones, rom.n_vavs
         self.o, self.V = o, V
@@ -60,27 +71,53 @@ class ThermalRom:
         self.n_p = o.asarray(rom._np)  # (V + Z, V): output response to air power
         self.m = o.asarray(rom._m)  # (V, V): reduced Q^T A^-1 P
         self.eye = o.eye(V)
+        m = np.asarray(rom._m, dtype=np.float64)
+        d = np.diag(m).copy()
+        if d.min() <= 0.0:
+            raise ValueError("the air-side matrix has a non-positive diagonal")
+        off = m - np.diag(d)
+        weight = 1.0 / d if g_max is None else g_max / (1.0 + g_max * d)
+        self.q = float(np.max(weight * np.abs(off).sum(axis=1)))
+        tol = 1e-8 if "float32" in str(o.dtype) else 1e-15
+        if air_solve == "lu" or self.q >= 0.5:
+            self.sweeps = None
+        else:  # the diagonal solve already leaves error <= q, each sweep multiplies it by q
+            self.sweeps = max(0, math.ceil(math.log(tol) / math.log(self.q)) - 1) if self.q > 0.0 else 0
+        self.m_diag, self.m_off_t = o.asarray(d), o.asarray(off.T)
         self.t_ref = float(rom.t_ref)
         self.x0 = o.asarray(rom.x0)
         self.y0 = o.asarray(rom.extra["y0"])
         self.h = float(rom.extra.get("h", np.nan))
 
-    def step(self, x, q_zone, t_amb, g, ts):
+    def pre_air(self, x, q_zone, t_amb):
+        """State and outputs (deviations) after everything but the VAV air."""
         x_pre = self.a * x + q_zone @ self.b_q.T + (t_amb - self.t_ref)[:, None] * self.b_a
-        y_pre = x_pre @ self.c.T
-        lhs = self.eye + g[:, :, None] * self.m
-        p = self.o.solve(lhs, g * ((ts - self.t_ref) - y_pre[:, :self.V]))
+        return x_pre, x_pre @ self.c.T
+
+    def step(self, x, q_zone, t_amb, g, ts):
+        x_pre, y_pre = self.pre_air(x, q_zone, t_amb)
+        p = self.air_power(g, (ts - self.t_ref) - y_pre[:, :self.V])
         return x_pre + p @ self.b_p.T, y_pre + p @ self.n_p.T + self.t_ref
+
+    def air_power(self, g, r):
+        """p with (I + G M) p = G r, r = supply minus the sensed temperature before the air acts."""
+        if self.sweeps is None:
+            return self.o.solve(self.eye + g[:, :, None] * self.m, g * r)
+        inv = g / (1.0 + g * self.m_diag)
+        p = inv * r
+        for _ in range(self.sweeps):
+            p = inv * (r - p @ self.m_off_t)
+        return p
 
 
 class BuildingEnv:
     def __init__(self, spec: BuildingSpec, rom: LinearRom, exo: Exogenous, num_envs: int = 1, ops: Ops | None = None,
                  exact: bool = True, emulate_f32: bool = True, episode_steps: int | None = None,
-                 compile_step: bool = False):
+                 air_solve: str = "auto", compile_backend: str | None = None):
         o = ops or Ops("numpy")
         self.o, self.spec = o, spec
         self.plant = Plant(spec, o, exact=exact, emulate_f32=emulate_f32)
-        self.rom = ThermalRom(rom, o)
+        self.rom = ThermalRom(rom, o, air_solve, self.plant.max_air_conductance())
         if np.isfinite(self.rom.h) and np.max(np.abs(exo.h - self.rom.h)) > 0.0:
             raise ValueError("the ROM was built for another convection coefficient than the weather gives")
         self.exo = {k: o.asarray(getattr(exo, k)) for k in EXO_STEP}
@@ -92,8 +129,8 @@ class BuildingEnv:
         self.episode_steps = min(episode_steps or exo.n_steps, exo.n_steps)
         self.k = 0
         self.state = None
-        if compile_step:  # torch only: the step body as one compiled graph (fuses the plant's elementwise ops)
-            self._advance = o.torch.compile(self._advance)
+        if compile_backend:  # torch only: the step body as one compiled graph (fuses the plant's elementwise ops)
+            self._advance = o.torch.compile(self._advance, backend=compile_backend)
 
     # ---- episode ----------------------------------------------------------------------------------------------
     def reset(self):
