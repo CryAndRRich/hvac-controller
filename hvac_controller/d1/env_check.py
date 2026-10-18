@@ -10,7 +10,8 @@ Tracer and compare:
 - T3 open loop: the replica alone, fed only the traced actions -> zone temperatures, rewards, energy;
 - T4 closed loop: the same policy acting on the replica's own observations -> scenario score (the gate), with where
   and in which component the two trajectories part;
-- T5 torch: T3 again in torch float64 / float32, gradcheck on a relaxed window, a long backward pass, step timing;
+- T5 torch: T3 again in torch float64 / float32, gradcheck on a relaxed window, a long backward pass (speed is
+  bench.py's job);
 - T6 noise floor (optional): the real environment against itself, the policy seeing its observations plus Gaussian
   noise of the size of the replica's observation error -> how far the score moves when nothing but the observations
   changes. A closed-loop gap inside that spread is the policy's sensitivity, not a replica error. The replica runs
@@ -20,19 +21,16 @@ Tracer and compare:
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import time
 from pathlib import Path
 
 import numpy as np
 
-from hvac_controller.d1.core import core_from_env
 from hvac_controller.d1.ops import Ops
 from hvac_controller.d1.plant import Plant
-from hvac_controller.d1.rom import build_rom
 from hvac_controller.d1.spec import BuildingSpec, Exogenous
-from hvac_controller.d1.torch_env import BuildingEnv
+from hvac_controller.d1.torch_env import BuildingEnv, replica_from_env
 from hvac_controller.d1.trace import Tracer, make_policy
 from hvac_controller.sim import load_env
 from smart_buildings import evaluate
@@ -89,6 +87,7 @@ def check_teacher_forced(spec: BuildingSpec, exo: Exogenous, tr: dict) -> dict:
                       exo.occ_rew[:n], exo.price_e[:n], exo.carbon_e[:n], exo.price_g[:n], exo.carbon_g[:n],
                       exo.max_cost[:n], exo.max_carbon[:n], exo.reward_dt[:n], exo.obs_exo[1:n + 1])
     obs0 = plant.reset_obs(1, exo.obs_exo[0][None])[0]
+    obs_err = np.abs(post["obs"] - tr["obs"]).max(axis=0)
     return {
         "decode": decode,
         "damper": _err(dev["damper"], tr["damper"]), "valve": _err(dev["valve"], tr["valve"]),
@@ -108,7 +107,7 @@ def check_teacher_forced(spec: BuildingSpec, exo: Exogenous, tr: dict) -> dict:
         "norm_carbon": _err(_f32(post["norm_carbon"]), tr["rr_normalized_carbon_emission"]),
         "reward": _err(post["reward"], tr["reward"]),
         "obs": _err(post["obs"], tr["obs"]), "obs0": _err(obs0, tr["obs0"]),
-        "obs_worst_field": spec.field_names[int(np.argmax(np.abs(post["obs"] - tr["obs"]).max(axis=0)))],
+        "obs_worst_field": spec.field_names[int(np.argmax(obs_err))] if obs_err.max() > 0.0 else "",
     }
 
 
@@ -163,7 +162,7 @@ def _first(mask) -> int:
     return int(rows[0]) if rows.size else -1
 
 
-def _action_name(spec, rows, j: int) -> str:
+def _action_name(rows, j: int) -> str:
     target, i = rows[j][0], rows[j][1]
     return f"{target}[{i}]"
 
@@ -177,8 +176,8 @@ def _divergence(spec, exo, ref: dict, run: dict, act_tol: float = 1e-3) -> dict:
     occ = np.asarray(exo.occ_rew[:n]) > 0.0
     k_c, k_d = _first(da > act_tol), _first(dd)
     out = {"first_cont_step": k_c, "first_disc_step": k_d,
-           "first_cont_action": _action_name(spec, spec.cont, int(np.argmax(da[k_c]))) if k_c >= 0 else "",
-           "first_disc_action": _action_name(spec, spec.disc, int(np.argmax(dd[k_d]))) if k_d >= 0 else "",
+           "first_cont_action": _action_name(spec.cont, int(np.argmax(da[k_c]))) if k_c >= 0 else "",
+           "first_disc_action": _action_name(spec.disc, int(np.argmax(dd[k_d]))) if k_d >= 0 else "",
            "disc_differ_frac": float(dd.any(1).mean()) if dd.size else 0.0,
            "first_zone_0p1k_step": _first(dz > 0.1), "first_zone_1k_step": _first(dz > 1.0),
            "zone_max_k": float(dz.max()), "zone_mae_k": float(dz.mean()),
@@ -371,23 +370,6 @@ def check_torch(spec, rom, exo, tr, ref: dict, n_steps: int) -> dict:
     out["long_backward"] = {"steps": long, "seconds": time.time() - t0, "grad_finite": bool(torch.isfinite(g).all()),
                             "grad_norm": float(g.norm()), "grad_norm_first_step": float(g[0].norm()),
                             "grad_norm_last_step": float(g[-1].norm())}
-    # Speed, float32, no grad.
-    speed = {}
-    for B in (1, 64, 1024):
-        env = BuildingEnv(spec, rom, exo, B, Ops("torch", dtype=torch.float32), emulate_f32=False)
-        env.reset()
-        a_c = torch.zeros((B, len(spec.cont)), dtype=torch.float32)
-        a_d = torch.ones((B, len(spec.disc)), dtype=torch.float32)
-        with torch.no_grad():
-            for _ in range(3):
-                env.step(a_c, a_d)
-            t0 = time.time()
-            steps = 30
-            for _ in range(steps):
-                env.step(a_c, a_d)
-        dt = time.time() - t0
-        speed[str(B)] = {"ms_per_step": dt / steps * 1e3, "env_steps_per_s": B * steps / dt}
-    out["speed_cpu_float32"] = speed
     return out
 
 
@@ -403,20 +385,15 @@ def run_env_check(config_gin: Path, out_dir: Path, policies=("pid_water",), step
         t0 = time.time()
         env, meta = load_env(config_gin)
         if spec is None:
-            spec = BuildingSpec.from_env(env)
-            occupancy = copy.deepcopy(env.building._occupancy)  # pristine: reset() already asks it
-        obs0 = env.reset()[0]
-        if rom is None:
-            t1 = time.time()
-            rom = build_rom(core_from_env(env))
-            report["rom_build_s"] = time.time() - t1
-            report["rom_order"] = rom.order
-            exo = Exogenous.from_env(env, spec, max(steps), occupancy)
+            spec, rom, exo, obs0, build = replica_from_env(env, max(steps))
+            report.update(rom_build_s=build["rom_s"], exo_build_s=build["exo_s"], rom_order=rom.order)
             report.update({"label": spec.label, "n_zones": spec.n_zones, "n_vavs": spec.n_vavs,
                            "n_ahus": spec.n_ahus, "n_obs": len(spec.obs), "n_cont": len(spec.cont),
                            "n_disc": len(spec.disc), "h": float(exo.h[0])})
             log(f"[env] {spec.label}: Z={spec.n_zones} V={spec.n_vavs} A={spec.n_ahus} r={rom.order} "
                 f"(ROM {report['rom_build_s']:.0f}s)")
+        else:
+            obs0 = env.reset()[0]
         tracer = Tracer(env)
         policy = make_policy(name, env, meta, seed)
         t1 = time.time()

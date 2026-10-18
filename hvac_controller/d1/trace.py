@@ -22,7 +22,7 @@ from smart_buildings import evaluate
 
 
 class ExcitePolicy:
-    def __init__(self, building_meta_data, action_spec, seed: int = 0, p_switch: float = 1 / 8,
+    def __init__(self, action_spec, seed: int = 0, p_switch: float = 1 / 8,
                  p_bound: float = 0.3, mean_off_steps: int = 24, mean_on_steps: int = 72):
         self.rng = np.random.default_rng(seed)
         self.n_c = int(action_spec["continuous_action"].shape[0])
@@ -47,7 +47,7 @@ class ExcitePolicy:
 
 def make_policy(name: str, env, meta, seed: int = 0):
     if name == "excite":
-        return ExcitePolicy(meta, env.action_spec(), seed=seed)
+        return ExcitePolicy(env.action_spec(), seed=seed)
     return evaluate.initialize_policy(evaluate.POLICY_MAP[name], meta, env.action_spec())
 
 

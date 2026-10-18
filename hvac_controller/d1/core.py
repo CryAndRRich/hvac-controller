@@ -220,12 +220,12 @@ def run_core_check(config_gin: Path, n_steps: int, swap: bool, out_dir: Path | N
         "share_steps_air_on": float(np.mean([gg.sum() > 0 for gg in a["g"]])) if len(a["g"]) else None,
     }
     if out_dir is not None:
-        save_core(env, rec, a, Path(out_dir))
+        save_core(rec, a, Path(out_dir))
         (Path(out_dir) / "report.json").write_text(json.dumps(report, indent=1))
     return report
 
 
-def save_core(env, rec: CoreRecorder, a: dict[str, np.ndarray], out_dir: Path) -> None:
+def save_core(rec: CoreRecorder, a: dict[str, np.ndarray], out_dir: Path) -> None:
     """Matrices and logged inputs/outputs that step B (reduced model) needs, for one (building, h)."""
     out_dir.mkdir(parents=True, exist_ok=True)
     s = rec.solver

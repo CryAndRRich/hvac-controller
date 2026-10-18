@@ -29,9 +29,7 @@ from smart_buildings.smart_control.utils import conversion_utils, regression_bui
 
 NON_ZONES = ("exterior_space", "interior_wall")
 
-# Continuous action targets and the discrete ones (run commands).
-ACTION_TARGETS = ("ahu_sp", "ahu_p", "ahu_r", "w_sp", "w_dp", "damper", "valve")
-DISCRETE_TARGETS = ("ahu_on", "w_on")
+# Action field -> target (the discrete ones, *_on, are the run commands).
 _AHU_ACTIONS = {"supervisor_run_command": "ahu_on", "supply_air_temperature_setpoint": "ahu_sp",
                 "supply_air_static_pressure_setpoint": "ahu_p", "recirculation_percentage_command": "ahu_r"}
 _HWS_ACTIONS = {"supervisor_run_command": "w_on", "supply_water_temperature_setpoint": "w_sp",
@@ -301,14 +299,10 @@ class Exogenous:
     max_carbon: np.ndarray
     reward_dt: np.ndarray  # (n,) seconds
     obs_exo: np.ndarray  # (n + 1, len(exo_fields))
-    times: np.ndarray  # (n + 1,) t_k as int64 ns (naive)
 
     @property
     def n_steps(self) -> int:
         return len(self.t_amb)
-
-    def arrays(self) -> dict[str, np.ndarray]:
-        return dict(self.__dict__)
 
     @classmethod
     def from_env(cls, env, spec: BuildingSpec, n_steps: int, occupancy=None) -> "Exogenous":
@@ -379,5 +373,4 @@ class Exogenous:
             price_e=np.array(price_e), carbon_e=np.array(carbon_e), price_g=np.array(price_g),
             carbon_g=np.array(carbon_g), max_cost=np.array(max_cost), max_carbon=np.array(max_carbon),
             reward_dt=np.array(reward_dt), obs_exo=obs_exo,
-            times=np.array([t.value for t in times[:n_steps + 1]], dtype=np.int64),
         )

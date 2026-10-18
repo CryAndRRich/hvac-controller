@@ -18,9 +18,9 @@ rational Krylov basis, (sigma E + K)^-1 F for a few shifts sigma in units of 1/d
 - sigma = 0 is steady state: every DC gain is exact;
 - sigma = 1/12 and 1/288 cover hours and a day (walls, mass).
 
-The reduced matrices are diagonalised (modal form: one decay factor per state), then cut down either by modal
-dominance or by balanced truncation (closed-form Gramians in modal coordinates). Dynamics that are cut keep their DC
-gain through a feedthrough term, so a truncated ROM is still exact at steady state.
+The reduced matrices are diagonalised (modal form: one decay factor per state). Step B keeps every mode: truncation
+(modal dominance, balanced truncation; tried 2026-10-18, D1 doc §5 step 2) saved at most half the states for errors
+of 0.01 K and more, so it was dropped.
 
 Everything runs in deviations from a reference temperature T_ref: the conduction rows of K sum to the ambient
 conductance, so a uniform shift of the field equals shifting the outside and supply temperatures by the same amount.
@@ -35,7 +35,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-import scipy.linalg
 import scipy.sparse
 import scipy.sparse.linalg
 
@@ -43,7 +42,6 @@ PERMC = "MMD_AT_PLUS_A"  # the organisers' column ordering
 BLOCK = 64  # right-hand sides per triangular solve
 # (shift in 1/dt, number of moments); sigma = 1 first so that A^-1 F is never deflated.
 DEFAULT_SHIFTS = ((1.0, 2), (0.0, 1), (1.0 / 12.0, 1), (1.0 / 288.0, 1))
-DEFAULT_ORDERS = (400, 200, 100, 50, 25)
 CHECKPOINTS = (12, 288)
 
 
@@ -272,42 +270,35 @@ def build_basis(aug: Augmented, f: scipy.sparse.csc_matrix, x0: np.ndarray, shif
 
 @dataclass
 class LinearRom:
-    """x' = A x + B w,  y' = C x' + D w,  with w = [zone heat (Z) | air power (V) | T_out - T_ref (1)].
+    """Modal form: x' = a * x + B w,  y' = C x',  with w = [zone heat (Z) | air power (V) | T_out - T_ref (1)].
 
-    y = [sensed per VAV (V) | mean per zone (Z)], in deviations from t_ref. A is a vector when diagonal (modal).
+    y = [sensed per VAV (V) | mean per zone (Z)], in deviations from t_ref; a holds one decay factor per mode.
     """
 
     a: np.ndarray
     b: np.ndarray
     c: np.ndarray
-    d: np.ndarray
     x0: np.ndarray
     t_ref: float
     n_zones: int
     n_vavs: int
-    scales: np.ndarray
-    name: str = ""
     extra: dict = field(default_factory=dict)
 
     def __post_init__(self):
         z, v = self.n_zones, self.n_vavs
         self._iq, self._ip, self._ia = slice(0, z), slice(z, z + v), z + v
         self._bp = self.b[:, self._ip]
-        self._np = self.c @ self._bp + self.d[:, self._ip]  # output response to air power, (V + Z) x V
+        self._np = self.c @ self._bp  # output response to air power, (V + Z) x V
         self._m = self._np[:v]  # the reduced S = Q^T A^-1 P
 
     @property
     def order(self) -> int:
         return len(self.x0)
 
-    def _amul(self, x):
-        return self.a * x if self.a.ndim == 1 else self.a @ x
-
     def step(self, x, q_zone, t_amb, g, ts):
         """One step with the air power solved implicitly, as the organisers do; returns (x', y' + t_ref)."""
-        da = t_amb - self.t_ref
-        x_pre = self._amul(x) + self.b[:, self._iq] @ q_zone + self.b[:, self._ia] * da
-        y_pre = self.c @ x_pre + self.d[:, self._iq] @ q_zone + self.d[:, self._ia] * da
+        x_pre = self.a * x + self.b[:, self._iq] @ q_zone + self.b[:, self._ia] * (t_amb - self.t_ref)
+        y_pre = self.c @ x_pre
         v = self.n_vavs
         p = np.linalg.solve(np.eye(v) + g[:, None] * self._m, g * ((ts - self.t_ref) - y_pre[:v]))
         return x_pre + self._bp @ p, y_pre + self._np @ p + self.t_ref
@@ -319,20 +310,6 @@ class LinearRom:
             x, y = self.step(x, seq["q_zone"][k], seq["t_amb"][k], seq["g"][k], seq["ts"][k])
             out.append(y)
         return np.asarray(out)
-
-    def step_gain(self) -> np.ndarray:
-        """Response of y' to w in the same step (first Markov parameter)."""
-        return self.c @ self.b + self.d
-
-    def dc_gain(self) -> np.ndarray:
-        if self.a.ndim == 1:
-            return self.c @ (self.b / (1.0 - self.a)[:, None]) + self.d
-        return self.c @ np.linalg.solve(np.eye(self.order) - self.a, self.b) + self.d
-
-    def save(self, path: Path) -> None:
-        np.savez_compressed(path, a=self.a, b=self.b, c=self.c, d=self.d, x0=self.x0, t_ref=self.t_ref,
-                            n_zones=self.n_zones, n_vavs=self.n_vavs, scales=self.scales, name=self.name,
-                            **{f"extra_{k}": np.asarray(v) for k, v in self.extra.items()})
 
 
 def reduce(aug: Augmented, basis: Basis, f: scipy.sparse.csc_matrix, x0: np.ndarray) -> dict[str, np.ndarray]:
@@ -351,95 +328,37 @@ def reduce(aug: Augmented, basis: Basis, f: scipy.sparse.csc_matrix, x0: np.ndar
             "e_err": float(np.abs(b.T @ b - np.eye(r)).max()), "f": f_r, "c": c_r, "x0": x0_r}
 
 
-def modal_rom(red: dict, t_ref: float, n_zones: int, n_vavs: int, scales: np.ndarray) -> LinearRom:
+def modal_rom(red: dict, t_ref: float, n_zones: int, n_vavs: int) -> LinearRom:
     lam, w = np.linalg.eigh(red["k"])
     lam_raw_min = float(lam.min())
     lam = np.maximum(lam, 1e-12)  # K_r is SPD; a clipped value means rounding, and lambda_raw_min reports it
     a = 1.0 / (1.0 + lam)
     b = a[:, None] * (w.T @ red["f"])
-    return LinearRom(a=a, b=b, c=red["c"] @ w, d=np.zeros((red["c"].shape[0], b.shape[1])), x0=w.T @ red["x0"],
-                     t_ref=t_ref, n_zones=n_zones, n_vavs=n_vavs, scales=scales, name=f"modal_{len(a)}",
+    return LinearRom(a=a, b=b, c=red["c"] @ w, x0=w.T @ red["x0"], t_ref=t_ref, n_zones=n_zones, n_vavs=n_vavs,
                      extra={"lambda": lam, "lambda_raw_min": lam_raw_min})
 
 
-def build_rom(core: Core, shifts=DEFAULT_SHIFTS, tol: float = 1e-6, log=None) -> LinearRom:
-    """The untruncated modal ROM of one core (step B's choice), with the exact outputs of the initial state."""
+def build_rom(core: Core, shifts=DEFAULT_SHIFTS, tol: float = 1e-6, log=None) -> tuple[LinearRom, dict]:
+    """The modal ROM of one core, with the exact outputs of the initial state; and how the build went."""
     log = log or (lambda s: None)
+    t0 = time.time()
     t_ref = float(np.mean(core.temp0))
     aug = Augmented(core)
     f = aug.inputs()
     x0 = aug.state0(t_ref)
-    basis, _ = build_basis(aug, f, x0, shifts, tol, log)
+    basis, basis_info = build_basis(aug, f, x0, shifts, tol, log)
+    t1 = time.time()
     red = reduce(aug, basis, f, x0)
     del basis
-    rom = modal_rom(red, t_ref, len(core.zone_names), core.applied.shape[1], np.ones(f.shape[1]))
+    rom = modal_rom(red, t_ref, len(core.zone_names), core.applied.shape[1])
     rom.extra["y0"] = np.concatenate([core.sensed @ core.temp0, core.zones.T @ core.temp0])
     rom.extra["h"] = core.h
-    return rom
-
-
-def load_rom(path: Path) -> LinearRom:
-    z = np.load(path)
-    extra = {k[len("extra_"):]: z[k] for k in z.files if k.startswith("extra_")}
-    return LinearRom(a=z["a"], b=z["b"], c=z["c"], d=z["d"], x0=z["x0"], t_ref=float(z["t_ref"]),
-                     n_zones=int(z["n_zones"]), n_vavs=int(z["n_vavs"]), scales=z["scales"], name=str(z["name"]),
-                     extra=extra)
-
-
-def modal_truncate(full: LinearRom, k: int) -> LinearRom:
-    """Keep the k most dominant modes (DC contribution, scaled inputs); the rest become a DC feedthrough."""
-    one_minus = 1.0 - full.a
-    score = np.linalg.norm(full.c, axis=0) * np.linalg.norm(full.b * full.scales, axis=1) / one_minus
-    keep = np.sort(np.argsort(score)[::-1][:k])
-    drop = np.setdiff1d(np.arange(full.order), keep)
-    d = full.d + full.c[:, drop] @ (full.b[drop] / one_minus[drop, None])
-    return LinearRom(a=full.a[keep], b=full.b[keep], c=full.c[:, keep], d=d, x0=full.x0[keep], t_ref=full.t_ref,
-                     n_zones=full.n_zones, n_vavs=full.n_vavs, scales=full.scales, name=f"modal_{k}")
-
-
-def _psd_sqrt(m: np.ndarray) -> np.ndarray:
-    mu, vec = np.linalg.eigh(0.5 * (m + m.T))
-    return vec * np.sqrt(np.maximum(mu, 0.0))
-
-
-def hankel(full: LinearRom):
-    """Square-root factors and Hankel singular values of the modal ROM (scaled inputs)."""
-    aa = 1.0 - np.outer(full.a, full.a)
-    bs = full.b * full.scales
-    lp = _psd_sqrt((bs @ bs.T) / aa)
-    lq = _psd_sqrt((full.c.T @ full.c) / aa)
-    u, s, vt = scipy.linalg.svd(lq.T @ lp, full_matrices=False)
-    return lp, lq, u, s, vt
-
-
-def balanced_truncate(full: LinearRom, k: int, factors, keep: str = "dc") -> LinearRom:
-    """Square-root balanced truncation; the feedthrough then keeps either the steady state ("dc") or the one-step
-    response ("step": the air-side S and every input's first-step effect) exact."""
-    lp, lq, u, s, vt = factors
-    k = min(k, int(np.sum(s > s[0] * 1e-14)))
-    root = 1.0 / np.sqrt(s[:k])
-    t = lp @ vt[:k].T * root
-    ti = (root[:, None] * u[:, :k].T) @ lq.T
-    rom = LinearRom(a=ti @ (full.a[:, None] * t), b=ti @ full.b, c=full.c @ t, d=full.d.copy(), x0=ti @ full.x0,
-                    t_ref=full.t_ref, n_zones=full.n_zones, n_vavs=full.n_vavs, scales=full.scales,
-                    name=f"balanced_{keep}_{k}", extra={"hsv_bound": 2.0 * float(np.sum(s[k:]))})
-    if keep == "dc":
-        rom.d = rom.d + (full.dc_gain() - rom.dc_gain())
-    else:
-        rom.d = rom.d + (full.step_gain() - rom.step_gain())
-    rom.__post_init__()
-    return rom
+    info = {"basis": basis_info, "e_r_err": red["e_err"], "k_r_asym": red["k_asym"], "n_mass": len(aug.mi),
+            "n_aug": aug.N, "x0_dev_max_k": float(np.abs(x0).max()), "basis_s": t1 - t0, "reduce_s": time.time() - t1}
+    return rom, info
 
 
 # -------------------------------------------------------------------------------------------- inputs to replay
-
-def input_scales(seq: dict, t_ref: float) -> np.ndarray:
-    """Typical size of each input in the logged rollout (W, W, K), for ranking and balancing."""
-    q = np.max(np.abs(seq["q_zone"]), axis=0)
-    p = np.max(np.abs(seq["g"] * (seq["ts"] - seq["sensed_free"])), axis=0)
-    a = np.max(np.abs(seq["t_amb"] - t_ref))
-    return np.maximum(np.concatenate([q, p, [a]]), 1.0)
-
 
 def random_sequence(seq: dict, n_steps: int, seed: int) -> dict[str, np.ndarray]:
     """Random excitation around the logged ranges: piecewise-constant heat, flows and supply temperatures, with
@@ -490,22 +409,21 @@ def time_steps(rom: LinearRom, seq: dict, n: int = 500) -> float:
 
 # ------------------------------------------------------------------------------------------------------ the check
 
-def run_rom_check(core_dir: Path, out_dir: Path, shifts=DEFAULT_SHIFTS, orders=DEFAULT_ORDERS, n_check: int = 288,
-                  n_random: int = 1152, seed: int = 0, tol: float = 1e-6, log=print) -> dict:
-    """Build the ROM of one saved core, replay it against the original, save ROMs and a report."""
+def run_rom_check(core_dir: Path, out_dir: Path, shifts=DEFAULT_SHIFTS, n_check: int = 288, n_random: int = 1152,
+                  seed: int = 0, tol: float = 1e-6, log=print) -> dict:
+    """Build the ROM of one saved core, replay it against the original, write a report."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     t_start = time.time()
     timings = {}
     core, seq = load_core(core_dir), load_sequence(core_dir)
     n_steps = len(seq["t_amb"])
-    n_zones, n_vavs = len(core.zone_names), core.applied.shape[1]
-    t_ref = float(np.mean(core.temp0))
+    n_vavs = core.applied.shape[1]
 
     t0 = time.time()
     full = FullModel(core)
     timings["full_setup_s"] = time.time() - t0
-    log(f"[rom] {core_dir.name}: n={core.n} zones={n_zones} vavs={n_vavs} steps={n_steps}")
+    log(f"[rom] {core_dir.name}: n={core.n} zones={len(core.zone_names)} vavs={n_vavs} steps={n_steps}")
 
     # 0. Our copy of the core, from the saved arrays, against the swap-free replay logged in step A.
     t0 = time.time()
@@ -515,77 +433,44 @@ def run_rom_check(core_dir: Path, out_dir: Path, shifts=DEFAULT_SHIFTS, orders=D
     loader_err = float(np.abs(full_logged[:, :n_vavs] - seq["sensed_free"][:n_check]).max())
     log(f"  saved core vs step A replay over {n_check} steps: {loader_err:.2e} K")
 
-    # 1. Basis and reduced matrices.
-    t0 = time.time()
-    aug = Augmented(core)
-    f = aug.inputs()
-    x0 = aug.state0(t_ref)
-    basis, basis_info = build_basis(aug, f, x0, shifts, tol, log)
-    timings["basis_s"] = time.time() - t0
-    t0 = time.time()
-    red = reduce(aug, basis, f, x0)
-    del basis
-    timings["reduce_s"] = time.time() - t0
-    scales = input_scales(seq, t_ref)
-    full_rom = modal_rom(red, t_ref, n_zones, n_vavs, scales)
-    lam = full_rom.extra["lambda"]
-    s_exact = full.s
-    s_rom = full_rom._m
-    log(f"  r={full_rom.order}  E_r err {red['e_err']:.1e}  K_r asym {red['k_asym']:.1e}  "
-        f"S err {np.abs(s_rom - s_exact).max() / np.abs(s_exact).max():.1e} (rel)")
+    # 1. The ROM.
+    rom, info = build_rom(core, shifts, tol, log)
+    timings.update(basis_s=info["basis_s"], reduce_s=info["reduce_s"])
+    lam = rom.extra["lambda"]
+    s_rel_err = float(np.abs(rom._m - full.s).max() / np.abs(full.s).max())
+    log(f"  r={rom.order}  E_r err {info['e_r_err']:.1e}  K_r asym {info['k_r_asym']:.1e}  S err {s_rel_err:.1e} (rel)")
 
-    # 2. Truncations.
-    t0 = time.time()
-    factors = hankel(full_rom)
-    roms = [full_rom]
-    for k in orders:
-        if k < full_rom.order:
-            roms.append(modal_truncate(full_rom, k))
-            roms.append(balanced_truncate(full_rom, k, factors, "dc"))
-            roms.append(balanced_truncate(full_rom, k, factors, "step"))
-    timings["truncate_s"] = time.time() - t0
-
-    # 3. Replays: the logged baseline rollout (vs the swap-free core and vs the real sensors) and a random excitation
+    # 2. Replays: the logged baseline rollout (vs the swap-free core and vs the real sensors) and a random excitation
     #    (vs the full core, which also gives the zone means).
     t0 = time.time()
     rand = random_sequence(seq, n_random, seed)
     full_rand = full.replay(rand, n_random)
     timings["full_random_s"] = time.time() - t0
-    variants = []
-    for rom in roms:
-        t0 = time.time()
-        y_log = rom.replay(seq, n_steps)
-        y_rand = rom.replay(rand, n_random)
-        variants.append({
-            "name": rom.name, "order": rom.order,
-            "logged_vs_core": error_stats(y_log[:, :n_vavs], seq["sensed_free"]),
-            "logged_vs_sensors": error_stats(y_log[:, :n_vavs], seq["sensed_env"]),
-            "random_vs_core_sensed": error_stats(y_rand[:, :n_vavs], full_rand[:, :n_vavs]),
-            "random_vs_core_zones": error_stats(y_rand[:, n_vavs:], full_rand[:, n_vavs:]),
-            "s_rel_err": float(np.abs(rom._m - s_exact).max() / np.abs(s_exact).max()),
-            "dc_gain_rel_err": float(np.abs(rom.dc_gain() - full_rom.dc_gain()).max()
-                                     / np.abs(full_rom.dc_gain()).max()),
-            "step_us": time_steps(rom, seq, min(500, n_steps)),
-            "hsv_bound_scaled": rom.extra.get("hsv_bound"),
-            "replay_s": time.time() - t0,
-        })
-        rom.save(out_dir / f"rom_{rom.name}.npz")
-        v, day, lg, rd = variants[-1], f"{min(288, n_steps)}_steps", f"{n_steps}_steps", f"{n_random}_steps"
-        log(f"  {rom.name:>14}: logged MAE@24h {v['logged_vs_core'][day]['mae']:.4f} K max {v['logged_vs_core'][lg]['max']:.4f} K"
-            f" | random MAE@24h {v['random_vs_core_zones'][f'{min(288, n_random)}_steps']['mae']:.4f} K"
-            f" max {v['random_vs_core_zones'][rd]['max']:.4f} K | S {v['s_rel_err']:.1e} | {v['step_us']:.0f} us/step")
+    t0 = time.time()
+    y_log = rom.replay(seq, n_steps)
+    y_rand = rom.replay(rand, n_random)
+    replay = {
+        "logged_vs_core": error_stats(y_log[:, :n_vavs], seq["sensed_free"]),
+        "logged_vs_sensors": error_stats(y_log[:, :n_vavs], seq["sensed_env"]),
+        "random_vs_core_sensed": error_stats(y_rand[:, :n_vavs], full_rand[:, :n_vavs]),
+        "random_vs_core_zones": error_stats(y_rand[:, n_vavs:], full_rand[:, n_vavs:]),
+        "step_us": time_steps(rom, seq, min(500, n_steps)), "replay_s": time.time() - t0,
+    }
+    day = f"{min(288, n_steps)}_steps"
+    log(f"  ROM r={rom.order}: logged MAE@24h {replay['logged_vs_core'][day]['mae']:.4f} K"
+        f" max {replay['logged_vs_core'][f'{n_steps}_steps']['max']:.4f} K | random MAE@24h"
+        f" {replay['random_vs_core_zones'][f'{min(288, n_random)}_steps']['mae']:.4f} K"
+        f" max {replay['random_vs_core_zones'][f'{n_random}_steps']['max']:.4f} K | {replay['step_us']:.0f} us/step")
 
     report = {
-        "core": str(core_dir), "n_solved": core.n, "n_mass": len(aug.mi), "n_aug": aug.N,
-        "n_zones": n_zones, "n_vavs": n_vavs, "h": core.h, "t_ref": t_ref, "steps_logged": n_steps,
-        "shifts": [list(s) for s in shifts], "tol": tol, "basis": basis_info,
-        "loader_err_k": loader_err, "e_r_err": red["e_err"], "k_r_asym": red["k_asym"],
-        "s_rel_err": float(np.abs(s_rom - s_exact).max() / np.abs(s_exact).max()),
-        "lambda_raw_min": full_rom.extra["lambda_raw_min"], "lambda_min": float(lam.min()), "lambda_max": float(lam.max()),
+        "core": str(core_dir), "n_solved": core.n, "n_mass": info["n_mass"], "n_aug": info["n_aug"],
+        "n_zones": len(core.zone_names), "n_vavs": n_vavs, "h": core.h, "t_ref": rom.t_ref, "steps_logged": n_steps,
+        "shifts": [list(s) for s in shifts], "tol": tol, "basis": info["basis"], "order": rom.order,
+        "loader_err_k": loader_err, "e_r_err": info["e_r_err"], "k_r_asym": info["k_r_asym"], "s_rel_err": s_rel_err,
+        "lambda_raw_min": rom.extra["lambda_raw_min"], "lambda_min": float(lam.min()), "lambda_max": float(lam.max()),
         "slowest_time_constant_h": float(1.0 / max(lam.min(), 1e-300) * 300.0 / 3600.0),
-        "hsv": factors[3][:60].tolist(), "random_share_air_off": rand["share_air_off"],
-        "x0_dev_max_k": float(np.abs(x0).max()),
-        "timings": timings, "variants": variants, "seconds": time.time() - t_start,
+        "random_share_air_off": rand["share_air_off"], "x0_dev_max_k": info["x0_dev_max_k"],
+        "replay": replay, "timings": timings, "seconds": time.time() - t_start,
     }
     (out_dir / "report.json").write_text(json.dumps(report, indent=1))
     return report

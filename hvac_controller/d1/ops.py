@@ -1,7 +1,8 @@
 """A thin array namespace, so the plant equations run unchanged on NumPy (validation) and PyTorch (training).
 
-Only what plant.py and the ROM step need. Scalars may be mixed with arrays everywhere; they are converted to the
-backend's dtype and device first, because torch.minimum and friends do not take Python numbers.
+Only what plant.py and the ROM step need. Python numbers may be mixed with arrays everywhere. On torch they go to
+clamp / where as numbers rather than as new tensors, because building a tensor from a number copies it to the
+device on every call.
 """
 
 from __future__ import annotations
@@ -43,11 +44,6 @@ class Ops:
             return self.torch.as_tensor(np.asarray(x, dtype=np.int64), device=self.device)
         return np.asarray(x, dtype=np.int64)
 
-    def zeros(self, shape):
-        if self.is_torch:
-            return self.torch.zeros(shape, dtype=self.dtype, device=self.device)
-        return np.zeros(shape, dtype=self.dtype)
-
     def full(self, shape, value):
         if self.is_torch:
             return self.torch.full(shape, float(value), dtype=self.dtype, device=self.device)
@@ -63,15 +59,15 @@ class Ops:
             return x.detach().cpu().to(self.torch.float64).numpy()
         return np.asarray(x, dtype=np.float64)
 
-    def _t(self, x):
-        return x if (not self.is_torch or isinstance(x, self.torch.Tensor)) else self.asarray(x)
+    def _is_t(self, x) -> bool:
+        return isinstance(x, self.torch.Tensor)
 
     # ---- elementwise ----------------------------------------------------------------------------------------------
     def where(self, cond, a, b):
         if self.is_torch:
-            if not isinstance(cond, self.torch.Tensor):
-                cond = self.torch.as_tensor(cond, device=self.device)
-            return self.torch.where(cond.bool(), self._t(a), self._t(b))
+            if not self._is_t(a) and not self._is_t(b):  # two numbers would give torch's default dtype
+                a = self.torch.full_like(cond, a, dtype=self.dtype)
+            return self.torch.where(cond, a, b)
         return np.where(cond, a, b)
 
     def amin(self, x, axis):
@@ -81,10 +77,22 @@ class Ops:
         return x.amax(dim=axis) if self.is_torch else x.max(axis=axis)
 
     def minimum(self, a, b):
-        return self.torch.minimum(self._t(a), self._t(b)) if self.is_torch else np.minimum(a, b)
+        if not self.is_torch:
+            return np.minimum(a, b)
+        if not self._is_t(b):
+            return self.torch.clamp(a, max=b)
+        if not self._is_t(a):
+            return self.torch.clamp(b, max=a)
+        return self.torch.minimum(a, b)
 
     def maximum(self, a, b):
-        return self.torch.maximum(self._t(a), self._t(b)) if self.is_torch else np.maximum(a, b)
+        if not self.is_torch:
+            return np.maximum(a, b)
+        if not self._is_t(b):
+            return self.torch.clamp(a, min=b)
+        if not self._is_t(a):
+            return self.torch.clamp(b, min=a)
+        return self.torch.maximum(a, b)
 
     def clip(self, x, lo, hi):
         return self.minimum(self.maximum(x, lo), hi)
@@ -93,29 +101,20 @@ class Ops:
         return self.maximum(x, 0.0)
 
     def sqrt(self, x):
-        return self.torch.sqrt(self._t(x)) if self.is_torch else np.sqrt(x)
+        return self.torch.sqrt(x) if self.is_torch else np.sqrt(x)
 
     def abs(self, x):
-        return self.torch.abs(self._t(x)) if self.is_torch else np.abs(x)
-
-    def sigmoid(self, x):
-        return self.torch.sigmoid(self._t(x)) if self.is_torch else 1.0 / (1.0 + np.exp(-x))
-
-    def log(self, x):
-        return self.torch.log(self._t(x)) if self.is_torch else np.log(x)
+        return self.torch.abs(x) if self.is_torch else np.abs(x)
 
     def round_f32(self, x):
         """Rounds to float32 and back: what storing a value in a protobuf `float` field does."""
         if self.is_torch:
-            return self._t(x).to(self.torch.float32).to(self.dtype)
+            return x.to(self.torch.float32).to(self.dtype)
         return np.asarray(x, dtype=np.float32).astype(self.dtype)
 
     # ---- reductions and linear algebra ----------------------------------------------------------------------------
     def sum(self, x, axis):
         return x.sum(dim=axis) if self.is_torch else x.sum(axis=axis)
-
-    def stack(self, xs, axis):
-        return self.torch.stack(xs, dim=axis) if self.is_torch else np.stack(xs, axis=axis)
 
     def concatenate(self, xs, axis):
         return self.torch.cat(xs, dim=axis) if self.is_torch else np.concatenate(xs, axis=axis)

@@ -160,7 +160,7 @@ class Plant:
         x, V = self.o, self.V
         sens = y[:, :V]
         recirc = sens @ self.ahu_w.T
-        mixed, supply = self._supply(dev, recirc, t_amb)
+        _, supply = self._supply(dev, recirc, t_amb)
         on = dev["ahu_on"]
         p_eff = self._switch(on, x.maximum(dev["ahu_p_cmd"], self.p_min), 0.0)
         p_v = p_eff[:, self.vav_ahu]
@@ -191,9 +191,8 @@ class Plant:
         gains = x.where(comfort[:, None] > 0.5, self.gain_on, self.gain_off)
         q_zone = reheat @ self.share.T + gains + occ_step * self.spec.sim["occupant_w"]
         g = flow * self.spec.phys["air_rho"] * self.spec.phys["air_cp"]
-        return {"sens": sens, "recirc": recirc, "mixed": mixed, "supply": supply, "p_eff": p_eff, "demand": demand,
-                "ratio": ratio, "flow": flow, "ahu_raw": ahu_raw, "ahu_flow": ahu_flow, "ff_sum": ff_sum, "dp": dp,
-                "q_water": q_water, "eff": eff, "reheat": reheat, "q_zone": q_zone, "g": g, "ts": ts,
+        return {"sens": sens, "p_eff": p_eff, "ratio": ratio, "flow": flow, "ahu_raw": ahu_raw, "ahu_flow": ahu_flow,
+                "ff_sum": ff_sum, "dp": dp, "q_water": q_water, "reheat": reheat, "q_zone": q_zone, "g": g, "ts": ts,
                 "tank_used": tank}
 
     def post(self, y_new, ret, dev: dict, aux: dict, t_amb_next, win_now, win_next, occ_rew, price_e, carbon_e,
@@ -265,8 +264,7 @@ class Plant:
         }
         return {"ret": ret_new, "tank": tank_new, "d_tank": d_tank, "cool": cool, "blower": blower, "pump": pump,
                 "gas": gas, "elec": elec, "regret": regret, "norm_cost": norm_cost, "norm_carbon": norm_carbon,
-                "productivity": actual, "total_occ": total_occ, "reward": reward,
-                "obs": self.observe(src, obs_exo_next)}
+                "reward": reward, "obs": self.observe(src, obs_exo_next)}
 
     def observe(self, src: dict, obs_exo):
         """Raw sources (B, width) and exogenous columns (B, n_exo) -> the observation vector the policy sees."""
