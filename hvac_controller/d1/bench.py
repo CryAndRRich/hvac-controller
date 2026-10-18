@@ -9,14 +9,22 @@ For one scenario, after building the replica once (torch_env.replica_from_env):
 3. forward: steps per second without gradients at each batch size, eager and, if asked, torch.compile'd;
 4. forward + backward: gradient windows of h steps on the relaxed plant (exact=False), loss = summed reward,
    actions as leaf tensors; env-steps per second, peak device memory, finite gradients;
-5. breakdown: device time of the ROM step (and of its V x V solve alone), plant.pre and plant.post at one batch size.
+5. breakdown: device time of the ROM step (and of its V x V solve alone), plant.pre and plant.post at one batch size;
+   and how diagonal the air-side system (I + G M) p = G r is, i.e. whether a few Jacobi sweeps (batched matvecs)
+   could replace the LU solve.
+
+Compiled runs reset dynamo before each environment: the cache is per code object, so every new environment
+recompiles ``_advance``, and past the recompile limit torch would quietly fall back to eager.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import math
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +37,19 @@ from hvac_controller.sim import load_env
 
 ACC_ROWS = 8  # action sequences compared with the NumPy reference
 ACC_BATCH = 64  # batch the device runs them in (rows ACC_ROWS.. are other seeds)
+# Inductor settings tried for the compiled backward (the default failed in Triton on a T4, torch 2.11, 2026-10-18).
+COMPILE_VARIANTS = {"compiled": {}, "compiled_no_persistent": {"triton.persistent_reductions": False}}
+
+
+def _failure(e: Exception) -> dict:
+    return {"error": f"{type(e).__name__}: {str(e)[:300]}", "detail": traceback.format_exc()[-6000:]}
+
+
+def _new_env(spec, rom, exo, B: int, device: str, compile_step: bool, **kw) -> BuildingEnv:
+    if compile_step:
+        torch._dynamo.reset()
+    return BuildingEnv(spec, rom, exo, B, Ops("torch", dtype=torch.float32, device=device), emulate_f32=False,
+                       compile_step=compile_step, **kw)
 
 
 def _sync(device: str) -> None:
@@ -78,7 +99,7 @@ def check_accuracy(spec, rom, exo, action_spec, device: str, n_steps: int, log=p
             runs[name] = _rollout(env, a_c, a_d, ACC_ROWS)
         out[name] = {**_compare(runs[name], ref, ACC_ROWS), "seconds": time.time() - t0}
         log(f"  accuracy {name}: zone max {out[name]['zone_max_k']:.2e} K, reward sum {out[name]['reward_sum_rel_max']:.2e}")
-    env = BuildingEnv(spec, rom, exo, 1, Ops("torch", dtype=torch.float32, device=device), emulate_f32=False)
+    env = _new_env(spec, rom, exo, 1, device, False)
     with torch.no_grad():
         single = _rollout(env, a_c[:, :1], a_d[:, :1], 1)
     out["batch_independence_float32"] = _compare(single, runs["float32"], 1)
@@ -98,8 +119,7 @@ def forward_speed(spec, rom, exo, device: str, batches, n_steps: int = 288, comp
     out = {}
     for B in batches:
         try:
-            env = BuildingEnv(spec, rom, exo, B, Ops("torch", dtype=torch.float32, device=device), emulate_f32=False,
-                              compile_step=compile_step)
+            env = _new_env(spec, rom, exo, B, device, compile_step)
             a_c, a_d = _random_actions(B, len(spec.cont), len(spec.disc), device)
             with torch.no_grad():
                 env.reset()
@@ -117,50 +137,50 @@ def forward_speed(spec, rom, exo, device: str, batches, n_steps: int = 288, comp
                 dt = time.time() - t0
             out[str(B)] = {"ms_per_step": dt / n_steps * 1e3, "env_steps_per_s": B * n_steps / dt, "first_step_s": first}
         except Exception as e:  # out of memory or a compile failure: report it and go on
-            out[str(B)] = {"error": f"{type(e).__name__}: {str(e)[:300]}"}
+            out[str(B)] = _failure(e)
             if device.startswith("cuda"):
                 torch.cuda.empty_cache()
     return out
 
 
+def _backward_once(spec, rom, exo, device: str, B: int, h: int, n_windows: int, compile_step: bool) -> dict:
+    """n_windows timed gradient windows after one warm-up window (which also compiles)."""
+    cuda = device.startswith("cuda")
+    env = _new_env(spec, rom, exo, B, device, compile_step, exact=False)
+    env.reset()
+    if cuda:
+        torch.cuda.reset_peak_memory_stats()
+    times, finite = [], True
+    for _ in range(n_windows + 1):
+        a_c, a_d = _random_actions(B, len(spec.cont), len(spec.disc), device, n=h)
+        a_c = (a_c * 0.9).requires_grad_(True)
+        a_d = a_d.clamp(0.05, 0.95).requires_grad_(True)  # relaxed run commands
+        _sync(device)
+        t0 = time.time()
+        total = 0.0
+        for k in range(h):
+            _, r, _, _ = env.step(a_c[k], a_d[k])
+            total = total + r.sum()
+        total.backward()
+        _sync(device)
+        times.append(time.time() - t0)
+        finite &= bool(torch.isfinite(a_c.grad).all()) and bool(torch.isfinite(a_d.grad).all())
+        env.clear_grad()
+    dt = float(np.mean(times[1:]))
+    return {"h": h, "B": B, "s_per_window": dt, "env_steps_per_s": B * h / dt, "grad_finite": finite,
+            "first_window_s": times[0], "peak_mem_gb": torch.cuda.max_memory_allocated() / 2 ** 30 if cuda else None}
+
+
 def backward_speed(spec, rom, exo, device: str, batches, windows, n_windows: int = 3,
                    compile_step: bool = False) -> dict:
     out = {}
-    cuda = device.startswith("cuda")
     for h in windows:
         for B in batches:
-            key = f"h{h}_B{B}"
-            env = None
-            try:
-                env = BuildingEnv(spec, rom, exo, B, Ops("torch", dtype=torch.float32, device=device), exact=False,
-                                  emulate_f32=False, compile_step=compile_step)
-                env.reset()
-                if cuda:
-                    torch.cuda.reset_peak_memory_stats()
-                times, finite = [], True
-                for w in range(n_windows + 1):  # the first window warms up (and compiles)
-                    a_c, a_d = _random_actions(B, len(spec.cont), len(spec.disc), device, n=h)
-                    a_c = (a_c * 0.9).requires_grad_(True)
-                    a_d = a_d.clamp(0.05, 0.95).requires_grad_(True)  # relaxed run commands
-                    _sync(device)
-                    t0 = time.time()
-                    total = 0.0
-                    for k in range(h):
-                        _, r, _, _ = env.step(a_c[k], a_d[k])
-                        total = total + r.sum()
-                    total.backward()
-                    _sync(device)
-                    times.append(time.time() - t0)
-                    finite &= bool(torch.isfinite(a_c.grad).all()) and bool(torch.isfinite(a_d.grad).all())
-                    env.clear_grad()
-                dt = float(np.mean(times[1:]))
-                out[key] = {"h": h, "B": B, "s_per_window": dt, "env_steps_per_s": B * h / dt, "grad_finite": finite,
-                            "first_window_s": times[0],
-                            "peak_mem_gb": torch.cuda.max_memory_allocated() / 2 ** 30 if cuda else None}
+            try:  # in its own frame, so an out-of-memory window releases its graph with the frame
+                out[f"h{h}_B{B}"] = _backward_once(spec, rom, exo, device, B, h, n_windows, compile_step)
             except Exception as e:
-                out[key] = {"h": h, "B": B, "error": f"{type(e).__name__}: {str(e)[:300]}"}
-            del env
-            if cuda:
+                out[f"h{h}_B{B}"] = {"h": h, "B": B, **_failure(e)}
+            if device.startswith("cuda"):
                 torch.cuda.empty_cache()
     return out
 
@@ -176,9 +196,31 @@ def _timeit(fn, device: str, n: int = 50) -> float:
     return (time.time() - t0) / n * 1e3
 
 
+def solve_diagnostics(spec, rom, g_rows: np.ndarray) -> dict:
+    """How far (I + G M) p = G r is from diagonal. Jacobi converges iff rho(D^-1 G M_off) < 1, D = I + diag(G M).
+
+    Rows: the air conductances of a running batch, and every VAV at full damper and the highest static pressure.
+    """
+    m = rom._m
+    d = np.diag(m)
+    off = m - np.diag(d)
+    p_hi = max(row[5] for row in spec.cont if row[0] == "ahu_p")
+    ph = spec.phys
+    g_full = ph["air_rho"] * ph["air_cp"] * spec.vav["max_flow"] * np.sqrt(p_hi / spec.vav["design_pressure"])
+    rho, inf = [], []
+    for g in np.vstack([g_rows, g_full[None]]):
+        j = (g / (1.0 + g * d))[:, None] * off
+        rho.append(float(np.abs(np.linalg.eigvals(j)).max()))
+        inf.append(float(np.abs(j).sum(1).max()))
+    r = max(rho)
+    return {"rows": len(rho), "rho_max": r, "rho_running_median": float(np.median(rho[:-1])), "rho_full_air": rho[-1],
+            "inf_norm_max": max(inf), "m_offdiag_rowsum_over_min_diag": float(np.abs(off).sum(1).max() / np.abs(d).min()),
+            "jacobi_sweeps_1e-7": math.ceil(math.log(1e-7) / math.log(r)) if 0.0 < r < 1.0 else None}
+
+
 def breakdown(spec, rom, exo, device: str, B: int) -> dict:
     """Milliseconds per call of each part of one step, on the state after a few steps."""
-    env = BuildingEnv(spec, rom, exo, B, Ops("torch", dtype=torch.float32, device=device), emulate_f32=False)
+    env = _new_env(spec, rom, exo, B, device, False)
     a_c, a_d = _random_actions(B, len(spec.cont), len(spec.disc), device)
     pl, tr, o = env.plant, env.rom, env.o
     with torch.no_grad():
@@ -207,7 +249,9 @@ def breakdown(spec, rom, exo, device: str, B: int) -> dict:
                                                  ones[:, None] * e["occ_step"]), device),
                 "rom_ms": _timeit(lambda: tr.step(s["x"], aux["q_zone"], t_amb, aux["g"], aux["ts"]), device),
                 "solve_ms": _timeit(lambda: o.solve(lhs, rhs), device),
-                "post_ms": _timeit(post, device)}
+                "bmm_ms": _timeit(lambda: torch.bmm(lhs, rhs.unsqueeze(-1)), device),  # one Jacobi sweep's matvec
+                "post_ms": _timeit(post, device),
+                "solve_diag": solve_diagnostics(spec, rom, o.to_numpy(aux["g"][:64]))}
 
 
 def run_bench(config_gin: Path, out_dir: Path, device: str, batches, windows, back_batches, n_steps: int,
@@ -248,11 +292,17 @@ def run_bench(config_gin: Path, out_dir: Path, device: str, batches, windows, ba
         log("  forward compiled " + " ".join(f"B{b}:{v.get('env_steps_per_s', 0):.0f}/s"
                                             for b, v in report["forward_compiled"].items()))
         save()
-        report["backward_compiled"] = backward_speed(spec, rom, exo, device, back_batches, windows[:1],
-                                                     compile_step=True)
-        log("  backward compiled " + " ".join(f"{k}:{v.get('env_steps_per_s', 0):.0f}/s"
-                                             for k, v in report["backward_compiled"].items()))
-        save()
+        import torch._inductor.config as inductor_config
+
+        for name, opts in COMPILE_VARIANTS.items():
+            try:  # an unknown config key must not end the bench
+                with inductor_config.patch(opts) if opts else contextlib.nullcontext():
+                    res = backward_speed(spec, rom, exo, device, back_batches, windows[:1], compile_step=True)
+            except Exception as e:
+                res = {"setup": _failure(e)}
+            report[f"backward_{name}"] = res
+            log(f"  backward {name} " + " ".join(f"{k}:{v.get('env_steps_per_s', 0):.0f}/s" for k, v in res.items()))
+            save()
     return report
 
 
@@ -262,7 +312,7 @@ def main() -> None:
     ap.add_argument("--config", type=Path, required=True)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--batches", default="1,64,256,1024,4096", help="forward batch sizes")
-    ap.add_argument("--back-batches", default="64,256,1024", help="forward + backward batch sizes")
+    ap.add_argument("--back-batches", default="64,256,1024,2048,4096", help="forward + backward batch sizes")
     ap.add_argument("--windows", default="32,128", help="gradient window lengths h")
     ap.add_argument("--steps", type=int, default=8640, help="episode length for the accuracy check")
     ap.add_argument("--compile", action="store_true", help="also time the torch.compile'd step")
