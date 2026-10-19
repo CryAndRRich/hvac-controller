@@ -73,23 +73,21 @@ hvac_controller/            # our own code, kept apart from the starter kit
   weather.py                # fetch + pack Climate.OneBuilding TMYx weather; read it back on Kaggle
   sim.py                    # load a fresh env; snapshot an env mid-episode (shares the LU factorization)
   probes.py                 # one-off checks the data pipeline depends on
-  d1/core.py                # direction 1, step A: isolate the thermal core, replay it, save matrices for the ROM
-  d1/rom.py                 # direction 1, step B: Krylov/Galerkin modal reduced model of the core, replay checks
-  d1/ops.py                 # direction 1, step C: one array namespace for NumPy and PyTorch
+  baseline_k10.py           # the public baseline K10 (Apache-2.0, vendored verbatim): comparison only, never submitted
+  d1/core.py                # direction 1, step A: the thermal core of a scenario; log the solver's inputs
+  d1/rom.py                 # step B: Krylov/Galerkin modal reduced model of the core
+  d1/ops.py                 # step C: one array namespace for NumPy and PyTorch
   d1/spec.py                # step C: static building spec + exogenous series, read from the organisers' env
   d1/plant.py               # step C: equipment, reward and observation as pure batched functions
-  d1/torch_env.py           # step C: BuildingEnv = ROM + plant, batched, NumPy or PyTorch; replica_from_env builds it
+  d1/torch_env.py           # BuildingEnv = ROM + plant, batched (rows with their own time, S scenarios of one building), NumPy or PyTorch
   d1/trace.py               # step C: ground-truth tracer for the organisers' env; structured random policy
-  d1/env_check.py           # step C: replica vs original, tiers T0-T5, T6 noise floor (real env vs itself)
-  d1/bench.py               # step D: float32 accuracy, forward / backward speed and memory on a GPU; compile variants
-  d1/grad_check.py          # step 5: gradients vs finite differences, by lag, first- vs zeroth-order variance
+  d1/env_check.py           # replica vs original, tiers T0-T5: the regression check for any change to the replica
+  d1/cache.py               # step 6: one scenario's replica inputs (spec, ROM, exogenous, metadata), pickled once
+  d1/evaluate.py            # step 6: score policies in the original and the replica over noise ensembles (null groups)
 notebooks/                  # Kaggle notebooks only; each clones this repo and calls hvac_controller
   00_probe.ipynb            # runs probes.py
-  10_d1_core_check.ipynb    # runs d1/core.py on three scenarios, swap off and on
-  11_d1_rom_check.ipynb     # self-contained: baseline rollout + core (d1/core.py), then d1/rom.py, three scenarios in parallel
-  12_d1_env_check.ipynb     # runs d1/env_check.py: MODE debug (3 scenarios x 2 days), gate (30 x 30 days, sharded) or noise (T6, 9 scenarios)
-  13_d1_speed.ipynb         # runs d1/bench.py on a T4 GPU, three scenarios one after the other
-  14_d1_grad_check.ipynb    # runs d1/grad_check.py and bench.py's cudagraphs variant on a T4, three scenarios
+  12_d1_env_check.ipynb     # runs d1/env_check.py: MODE debug (3 scenarios x 2 days) or gate (30 x 30 days, sharded)
+  20_d1_cache.ipynb         # caches + K10 null group (original and replica): MODE pilot (atlanta_2) or all (sharded)
 ```
 
 ## Install

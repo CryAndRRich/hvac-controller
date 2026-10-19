@@ -63,7 +63,7 @@ class Tracer:
         self.ahus = _ahus(hvac)
         self.hws = hvac.hot_water_system
         self.boiler, self.pump = self.hws._heat_source, self.hws._pump
-        self.core = CoreRecorder(env, verify=False)
+        self.core = CoreRecorder(env)
         self.rows: list[dict] = []
         self._row: dict = {}
         self._phase = None
@@ -186,6 +186,6 @@ class Tracer:
         core = self.core.arrays()
         for k in self.rows[0]:
             out[k] = np.stack([np.asarray(row[k], dtype=np.float64) for row in self.rows])
-        for k in ("q_zone", "g", "ts", "t_amb", "h", "sensed_env"):
+        for k in ("q_zone", "g", "ts", "t_amb", "h"):
             out[f"core_{k}"] = np.asarray(core[k], dtype=np.float64)
         return out

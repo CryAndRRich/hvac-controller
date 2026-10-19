@@ -1,13 +1,16 @@
-"""The differentiable copy of one scenario: ROM (step B) + plant (plant.py), batched, on NumPy or PyTorch.
+"""The differentiable copy of one building: ROM (step B) + plant (plant.py), batched, on NumPy or PyTorch.
 
 ``BuildingEnv`` follows the batched interface SHAC-style learners use (DiffRL, rewarped): ``num_envs``, ``num_obs``,
 ``num_actions``, ``reset``, ``step(action) -> obs, reward, done, extras`` and ``clear_grad`` (cut the graph between
 windows). The action is the competition's hybrid action: continuous values in [-1, 1] and discrete run commands in
-{0, 1} (any value in [0, 1] when ``exact=False``). Continuous values must stay in [-1, 1], as the organisers require:
-the air solve's sweep count relies on it.
+{0, 1} (any value in [0, 1] when ``exact=False``; with 0 / 1 that relaxed plant computes exactly what the exact one
+does). Continuous values must stay in [-1, 1], as the organisers require: the air solve's sweep count relies on it.
 
-One environment holds one building (one ROM). Its batch runs B copies of it, each with its own actions; the
-exogenous series is shared and every copy sits at the same step. With the NumPy backend it is the validation
+One environment holds one building and S scenarios of it (same plant; each scenario its own ROM, for its materials
+and convection coefficient, and its own exogenous series). Its batch of B = S * b rows is grouped: row i runs
+scenario i // b. Every row has its own step index ``k``, so rows can sit at different times of their episode; a row
+whose episode ends is put back to the scenario's initial state by ``reset_done``. Nothing in a step reads a tensor
+value on the host, so a window can be captured as a CUDA graph. With the NumPy backend and S = 1 it is the validation
 replica that env_check compares with the organisers' simulator.
 
 ``replica_from_env`` builds the three inputs (spec, ROM, exogenous series) from a freshly loaded environment.
@@ -50,59 +53,74 @@ def replica_from_env(env, n_steps: int, log=None) -> tuple[BuildingSpec, LinearR
 
 
 class ThermalRom:
-    """LinearRom.step for a batch: x' = a * x + B w, y' = C x', with the VAV air power solved implicitly.
+    """LinearRom.step for S stacked ROMs of one building and a grouped batch: x' = a * x + B w, y' = C x', with the
+    VAV air power solved implicitly. Orders are padded to the largest with modes a = 0, B = 0, C = 0, which stay
+    zero and add nothing, so every scenario steps exactly as alone.
 
     The air power solves (I + G M) p = G r, G = diag(g). M (V x V) is nearly diagonal: within one step a VAV's air
-    barely reaches the sensors of other zones. So, unless ``air_solve="lu"``, it is solved by Jacobi sweeps
-    p <- D^-1 G (r - M_off p), D = I + diag(g * m_ii), whose error contracts by ||D^-1 G M_off||_inf
-    <= q = max_i g_i / (1 + g_i m_ii) * sum_j |m_ij|. That grows with every g_i, so q is taken at ``g_max``, the
-    largest conductance any valid action gives (or g -> inf, 1 / m_ii, without it). The number of sweeps is fixed
-    from q and the dtype, so the result is within 1e-8 (float32) or 1e-15 (float64) of the exact solve for every
-    valid action, with no device sync. If q >= 0.5 it falls back to the batched LU solve.
+    barely reaches the sensors of other zones. So it is solved by Jacobi sweeps p <- D^-1 G (r - M_off p),
+    D = I + diag(g * m_ii), whose error contracts by ||D^-1 G M_off||_inf <= q = max_i g_i / (1 + g_i m_ii) *
+    sum_j |m_ij|. That grows with every g_i, so q is taken at ``g_max``, the largest conductance any valid action
+    gives, and over all S scenarios. The number of sweeps is fixed from q and the dtype, so the result is within 1e-8
+    (float32) or 1e-15 (float64) of the exact solve for every valid action, with no device sync. If q >= 0.5 it falls
+    back to the batched LU solve.
     """
 
-    def __init__(self, rom: LinearRom, ops: Ops, air_solve: str = "auto", g_max: np.ndarray | None = None):
+    def __init__(self, roms: list[LinearRom], ops: Ops, g_max: np.ndarray):
         o = ops
-        Z, V = rom.n_zones, rom.n_vavs
-        self.o, self.V = o, V
-        self.a = o.asarray(rom.a)
-        self.b_q, self.b_p, self.b_a = o.asarray(rom.b[:, :Z]), o.asarray(rom.b[:, Z:Z + V]), o.asarray(rom.b[:, Z + V])
-        self.c = o.asarray(rom.c)
-        self.n_p = o.asarray(rom._np)  # (V + Z, V): output response to air power
-        self.m = o.asarray(rom._m)  # (V, V): reduced Q^T A^-1 P
-        self.eye = o.eye(V)
-        m = np.asarray(rom._m, dtype=np.float64)
-        d = np.diag(m).copy()
+        Z, V = roms[0].n_zones, roms[0].n_vavs
+        S, r = len(roms), max(rom.order for rom in roms)
+        self.o, self.S, self.V = o, S, V
+
+        def stack(get, shape):
+            out = np.zeros((S,) + shape)
+            for s, rom in enumerate(roms):
+                v = get(rom)
+                out[(s,) + tuple(slice(0, n) for n in v.shape)] = v
+            return out
+
+        self.a = o.asarray(stack(lambda m: m.a, (r,))[:, None, :])  # (S, 1, r)
+        self.b_q_t = o.asarray(stack(lambda m: m.b[:, :Z].T, (Z, r)))  # (S, Z, r)
+        self.b_p_t = o.asarray(stack(lambda m: m.b[:, Z:Z + V].T, (V, r)))
+        self.b_a = o.asarray(stack(lambda m: m.b[:, Z + V], (r,))[:, None, :])
+        self.c_t = o.asarray(stack(lambda m: m.c.T, (r, V + Z)))  # (S, r, V + Z)
+        self.n_p_t = o.asarray(np.stack([rom._np.T for rom in roms]))  # (S, V, V + Z): output response to air power
+        m = np.stack([np.asarray(rom._m, dtype=np.float64) for rom in roms])  # (S, V, V): reduced Q^T A^-1 P
+        d = np.diagonal(m, axis1=1, axis2=2).copy()
         if d.min() <= 0.0:
             raise ValueError("the air-side matrix has a non-positive diagonal")
-        off = m - np.diag(d)
-        weight = 1.0 / d if g_max is None else g_max / (1.0 + g_max * d)
-        self.q = float(np.max(weight * np.abs(off).sum(axis=1)))
+        off = m - d[:, :, None] * np.eye(V)
+        weight = g_max / (1.0 + g_max * d)
+        self.q = float(np.max(weight * np.abs(off).sum(axis=2)))
         tol = 1e-8 if "float32" in str(o.dtype) else 1e-15
-        if air_solve == "lu" or self.q >= 0.5:
+        if self.q >= 0.5:
             self.sweeps = None
+            self.m, self.eye = o.asarray(m[:, None]), o.eye(V)
         else:  # the diagonal solve already leaves error <= q, each sweep multiplies it by q
             self.sweeps = max(0, math.ceil(math.log(tol) / math.log(self.q)) - 1) if self.q > 0.0 else 0
-        self.m_diag, self.m_off_t = o.asarray(d), o.asarray(off.T)
-        self.t_ref = float(rom.t_ref)
-        self.x0 = o.asarray(rom.x0)
-        self.y0 = o.asarray(rom.extra["y0"])
-        self.h = float(rom.extra.get("h", np.nan))
-
-    def pre_air(self, x, q_zone, t_amb):
-        """State and outputs (deviations) after everything but the VAV air."""
-        x_pre = self.a * x + q_zone @ self.b_q.T + (t_amb - self.t_ref)[:, None] * self.b_a
-        return x_pre, x_pre @ self.c.T
+        self.m_diag, self.m_off_t = o.asarray(d[:, None, :]), o.asarray(np.transpose(off, (0, 2, 1)))
+        self.t_ref = o.asarray(np.array([rom.t_ref for rom in roms])[:, None, None])  # (S, 1, 1)
+        self.x0 = stack(lambda m: m.x0, (r,))  # (S, r), NumPy: rows take theirs in BuildingEnv
+        self.y0 = np.stack([rom.y0 for rom in roms])  # (S, V + Z)
 
     def step(self, x, q_zone, t_amb, g, ts):
-        x_pre, y_pre = self.pre_air(x, q_zone, t_amb)
-        p = self.air_power(g, (ts - self.t_ref) - y_pre[:, :self.V])
-        return x_pre + p @ self.b_p.T, y_pre + p @ self.n_p.T + self.t_ref
+        """x (B, r), q_zone (B, Z), t_amb (B,), g and ts (B, V) -> x' (B, r) and y' (B, V + Z) in kelvin."""
+        S = self.S
+
+        def grouped(v):
+            return v.reshape(S, v.shape[0] // S, *v.shape[1:])
+
+        x_pre = (self.a * grouped(x) + grouped(q_zone) @ self.b_q_t
+                 + (grouped(t_amb)[:, :, None] - self.t_ref) * self.b_a)
+        y_pre = x_pre @ self.c_t
+        p = self.air_power(grouped(g), (grouped(ts) - self.t_ref) - y_pre[:, :, :self.V])
+        x_new, y_new = x_pre + p @ self.b_p_t, y_pre + p @ self.n_p_t + self.t_ref
+        return x_new.reshape(x.shape), y_new.reshape(x.shape[0], -1)
 
     def air_power(self, g, r):
-        """p with (I + G M) p = G r, r = supply minus the sensed temperature before the air acts."""
+        """p with (I + G M) p = G r, r = supply minus the sensed temperature before the air acts; g, r (S, b, V)."""
         if self.sweeps is None:
-            return self.o.solve(self.eye + g[:, :, None] * self.m, g * r)
+            return self.o.solve(self.eye + g[..., None] * self.m, g * r)
         inv = g / (1.0 + g * self.m_diag)
         p = inv * r
         for _ in range(self.sweeps):
@@ -111,63 +129,80 @@ class ThermalRom:
 
 
 class BuildingEnv:
-    def __init__(self, spec: BuildingSpec, rom: LinearRom, exo: Exogenous, num_envs: int = 1, ops: Ops | None = None,
-                 exact: bool = True, emulate_f32: bool = True, episode_steps: int | None = None,
-                 air_solve: str = "auto", compile_backend: str | None = None):
+    def __init__(self, spec: BuildingSpec, rom: LinearRom | list[LinearRom], exo: Exogenous | list[Exogenous],
+                 num_envs: int = 1, ops: Ops | None = None, exact: bool = True, emulate_f32: bool = True):
         o = ops or Ops("numpy")
-        self.o, self.spec = o, spec
+        roms, exos = (rom if isinstance(rom, list) else [rom]), (exo if isinstance(exo, list) else [exo])
+        S = len(roms)
+        if len(exos) != S or num_envs % S:
+            raise ValueError(f"{S} ROMs, {len(exos)} exogenous series, {num_envs} rows: need one series per ROM and "
+                             "the same number of rows for each")
+        for m, e in zip(roms, exos):
+            if np.max(np.abs(e.h - m.h)) > 0.0:
+                raise ValueError("a ROM was built for another convection coefficient than its weather gives")
+        self.n_steps = exos[0].n_steps
+        if any(e.n_steps != self.n_steps for e in exos):
+            raise ValueError("exogenous series of different lengths")
+        self.o, self.spec, self.S, self.num_envs = o, spec, S, num_envs
         self.plant = Plant(spec, o, exact=exact, emulate_f32=emulate_f32)
-        self.rom = ThermalRom(rom, o, air_solve, self.plant.max_air_conductance())
-        if np.isfinite(self.rom.h) and np.max(np.abs(exo.h - self.rom.h)) > 0.0:
-            raise ValueError("the ROM was built for another convection coefficient than the weather gives")
-        self.exo = {k: o.asarray(getattr(exo, k)) for k in EXO_STEP}
-        self.obs_exo = o.asarray(exo.obs_exo)
-        self.num_envs = num_envs
-        self.ones = o.asarray(np.ones(num_envs))  # exogenous values are shared; broadcast them over the batch
+        self.rom = ThermalRom(roms, o, self.plant.max_air_conductance())
+        # Exogenous series as one (S * n, F) table: a step gathers one row per batch row.
+        cols, self.exo_cols, start = [], {}, 0
+        for name in EXO_STEP:
+            v = np.stack([np.asarray(getattr(e, name), dtype=np.float64).reshape(self.n_steps, -1) for e in exos])
+            width = v.shape[2]
+            self.exo_cols[name] = start if getattr(exos[0], name).ndim == 1 else slice(start, start + width)
+            cols.append(v)
+            start += width
+        self.exo = o.asarray(np.concatenate(cols, 2).reshape(S * self.n_steps, start))
+        self.obs_exo = o.asarray(np.concatenate([e.obs_exo for e in exos]))  # (S * (n + 1), n_exo)
+        self.row_s = o.index(np.arange(num_envs) // (num_envs // S))  # scenario of each row
+        rows = np.arange(num_envs) // (num_envs // S)
+        self.init = {"x": o.asarray(self.rom.x0[rows]), "y": o.asarray(self.rom.y0[rows]),
+                     "tank": o.full((num_envs,), spec.tank0), "ret": o.full((num_envs,), spec.ret0)}
         self.num_obs = self.plant.n_obs
         self.num_actions = (len(spec.cont), len(spec.disc))
-        self.episode_steps = min(episode_steps or exo.n_steps, exo.n_steps)
-        self.k = 0
+        self.obs0 = self.plant.reset_obs(num_envs, self.obs_exo[self.row_s * (self.n_steps + 1)])
+        self.k = None
         self.state = None
-        if compile_backend:  # torch only: the step body as one compiled graph (fuses the plant's elementwise ops)
-            self._advance = o.torch.compile(self._advance, backend=compile_backend)
-        # CUDA-graph replays reuse their output buffers, so the state, observation and reward that outlive a step are
-        # copied (only those: the other outputs in extras["post"] are valid until the next step).
-        self._own_outputs = compile_backend == "cudagraphs"
 
     # ---- episode ----------------------------------------------------------------------------------------------
     def reset(self):
-        o, B = self.o, self.num_envs
-        ones = self.ones[:, None]
-        self.state = {"x": ones * self.rom.x0, "y": ones * self.rom.y0,
-                      "tank": o.full((B,), self.spec.tank0), "ret": o.full((B,), self.spec.ret0)}
-        self.k = 0
-        self.obs = self.plant.reset_obs(B, ones * self.obs_exo[0])
+        """Every row at the start of its scenario's episode."""
+        o = self.o
+        self.state = {name: v + 0.0 for name, v in self.init.items()}
+        self.k = o.index(np.zeros(self.num_envs, dtype=np.int64))
+        self.obs = self.obs0 + 0.0
+        return self.obs
+
+    def reset_done(self, done):
+        """Rows whose episode ended (done, bool (B,)) back to their initial state and observation; others untouched."""
+        o = self.o
+        self.state = {name: o.where(done[:, None] if v.ndim == 2 else done, self.init[name], v)
+                      for name, v in self.state.items()}
+        self.k = o.where(done, 0 * self.k, self.k)
+        self.obs = o.where(done[:, None], self.obs0, self.obs)
         return self.obs
 
     def step(self, a_cont, a_disc):
         o, k = self.o, self.k
-        e = {name: v[k] for name, v in self.exo.items()}
-        self.state, out = self._advance(self.state, o.asarray(a_cont), o.asarray(a_disc), e, self.obs_exo[k + 1])
-        if self._own_outputs:
-            self.state = {name: v.clone() for name, v in self.state.items()}
-            out = {**out, "obs": out["obs"].clone(), "reward": out["reward"].clone()}
+        e = self.exo[self.row_s * self.n_steps + k]
+        obs_exo_next = self.obs_exo[self.row_s * (self.n_steps + 1) + k + 1]
+        self.state, out = self._advance(self.state, o.asarray(a_cont), o.asarray(a_disc), e, obs_exo_next)
         self.k = k + 1
         self.obs = out["obs"]
-        return out["obs"], out["reward"], self.k >= self.episode_steps, {"post": out, "y": self.state["y"]}
+        return out["obs"], out["reward"], self.k >= self.n_steps, {"post": out, "y": self.state["y"]}
 
-    def _advance(self, s: dict, a_cont, a_disc, e: dict, obs_exo_next) -> tuple[dict, dict]:
-        """One step as a pure function of arrays: state, actions and this step's exogenous row -> state', outputs."""
+    def _advance(self, s: dict, a_cont, a_disc, e, obs_exo_next) -> tuple[dict, dict]:
+        """One step as a pure function of arrays: state, actions and each row's exogenous row -> state', outputs."""
+        c = self.exo_cols
         dev = self.plant.decode(a_cont, a_disc)
-        ones = self.ones
-        t_amb = ones * e["t_amb"]
-        aux = self.plant.pre(s["y"], s["tank"], dev, t_amb, ones * e["comfort"], ones[:, None] * e["occ_step"])
-        x_new, y_new = self.rom.step(s["x"], aux["q_zone"], t_amb, aux["g"], aux["ts"])
+        aux = self.plant.pre(s["y"], s["tank"], dev, e[:, c["t_amb"]], e[:, c["comfort"]], e[:, c["occ_step"]])
+        x_new, y_new = self.rom.step(s["x"], aux["q_zone"], e[:, c["t_amb"]], aux["g"], aux["ts"])
         out = self.plant.post(
-            y_new, s["ret"], dev, aux, ones * e["t_amb_next"], ones[:, None] * e["win_now"],
-            ones[:, None] * e["win_next"], ones[:, None] * e["occ_rew"], ones * e["price_e"], ones * e["carbon_e"],
-            ones * e["price_g"], ones * e["carbon_g"], ones * e["max_cost"], ones * e["max_carbon"],
-            ones * e["reward_dt"], ones[:, None] * obs_exo_next)
+            y_new, s["ret"], dev, aux, e[:, c["t_amb_next"]], e[:, c["win_now"]], e[:, c["win_next"]],
+            e[:, c["occ_rew"]], e[:, c["price_e"]], e[:, c["carbon_e"]], e[:, c["price_g"]], e[:, c["carbon_g"]],
+            e[:, c["max_cost"]], e[:, c["max_carbon"]], e[:, c["reward_dt"]], obs_exo_next)
         return {"x": x_new, "y": y_new, "tank": out["tank"], "ret": out["ret"]}, out
 
     def clear_grad(self) -> None:

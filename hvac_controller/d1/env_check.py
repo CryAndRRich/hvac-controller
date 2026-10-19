@@ -8,14 +8,12 @@ Tracer and compare:
   -> every intermediate (q, g, Ts, flows, hot water, tank, billed energy, reward terms, observation) to rounding;
   plus decode(action) against the settings the devices hold;
 - T3 open loop: the replica alone, fed only the traced actions -> zone temperatures, rewards, energy;
-- T4 closed loop: the same policy acting on the replica's own observations -> scenario score (the gate), with where
-  and in which component the two trajectories part;
-- T5 torch: T3 again in torch float64 / float32, gradcheck on a relaxed window, a long backward pass (speed is
-  bench.py's job);
-- T6 noise floor (optional): the real environment against itself, the policy seeing its observations plus Gaussian
-  noise of the size of the replica's observation error -> how far the score moves when nothing but the observations
-  changes. A closed-loop gap inside that spread is the policy's sensitivity, not a replica error. The replica runs
-  under the same noise draws, so the two ensembles are compared pairwise.
+- T4 closed loop: the same policy acting on the replica's own observations -> scenario score and its three terms.
+  pid_water's closed loop is chaotic (step C, D1 doc §2.7): a gap here is judged against a noise ensemble
+  (evaluate.py), not by a fixed tolerance;
+- T5 torch: T3 again in torch float64 / float32, gradcheck on a relaxed window, a 288-step backward pass.
+
+Step C passed on all 30 scenarios (2026-10-18); this is now the regression check for any change to the replica.
 """
 
 from __future__ import annotations
@@ -27,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
+from hvac_controller.d1.evaluate import obs_noise_mask
 from hvac_controller.d1.ops import Ops
 from hvac_controller.d1.plant import Plant
 from hvac_controller.d1.spec import BuildingSpec, Exogenous
@@ -116,7 +115,7 @@ def _rollout(env: BuildingEnv, actions=None, policy=None, action_spec=None, n_st
     o = env.o
     obs = env.reset()
     out = {"obs0": o.to_numpy(obs)[0], "reward": [], "zone": [], "elec": [], "gas": [], "regret": [], "cost": [],
-           "carbon": [], "obs": [], "tank": [], "a_cont": [], "a_disc": []}
+           "carbon": [], "obs": [], "tank": []}
     for k in range(n_steps):
         if actions is not None:
             a_c, a_d = actions[0][k], actions[1][k]
@@ -135,17 +134,14 @@ def _rollout(env: BuildingEnv, actions=None, policy=None, action_spec=None, n_st
         out["carbon"].append(float(o.to_numpy(post["norm_carbon"])[0]))
         out["tank"].append(float(o.to_numpy(post["tank"])[0]))
         out["obs"].append(o.to_numpy(obs)[0])
-        out["a_cont"].append(np.asarray(a_c, dtype=np.float64))
-        out["a_disc"].append(np.asarray(a_d, dtype=np.float64))
-        if done:
+        if bool(np.asarray(o.to_numpy(done)).all()):
             break
     return {k: (np.asarray(v) if isinstance(v, list) else v) for k, v in out.items()}
 
 
 def _traj(tr: dict) -> dict:
-    """A trace in the layout _rollout returns, for the comparisons below."""
-    return {"reward": tr["reward"], "zone": tr["zone_post"], "a_cont": tr["a_cont"], "a_disc": tr["a_disc"],
-            "obs": tr["obs"], "obs0": tr["obs0"], "regret": tr["rr_normalized_productivity_regret"],
+    """The reward terms of a trace, in the layout _rollout returns."""
+    return {"reward": tr["reward"], "regret": tr["rr_normalized_productivity_regret"],
             "cost": tr["rr_normalized_energy_cost"], "carbon": tr["rr_normalized_carbon_emission"]}
 
 
@@ -154,75 +150,6 @@ def _score(t: dict) -> dict:
     n = len(t["reward"])
     return {"score": float(abs(np.sum(t["reward"])) / n), "regret": float(np.mean(t["regret"])),
             "cost": float(np.mean(t["cost"])), "carbon": float(np.mean(t["carbon"])), "steps": int(n)}
-
-
-def _first(mask) -> int:
-    """First step (axis 0) where mask holds anywhere, -1 if never."""
-    rows = np.flatnonzero(np.asarray(mask).reshape(len(mask), -1).any(1))
-    return int(rows[0]) if rows.size else -1
-
-
-def _action_name(rows, j: int) -> str:
-    target, i = rows[j][0], rows[j][1]
-    return f"{target}[{i}]"
-
-
-def _divergence(spec, exo, ref: dict, run: dict, act_tol: float = 1e-3) -> dict:
-    """Where and how far a closed-loop trajectory leaves a reference one (both in the _rollout layout)."""
-    n = min(len(ref["reward"]), len(run["reward"]))
-    da = np.abs(np.asarray(run["a_cont"][:n], dtype=np.float64) - np.asarray(ref["a_cont"][:n], dtype=np.float64))
-    dd = np.asarray(run["a_disc"][:n]) != np.asarray(ref["a_disc"][:n])
-    dz = np.abs(np.asarray(run["zone"][:n]) - np.asarray(ref["zone"][:n]))
-    occ = np.asarray(exo.occ_rew[:n]) > 0.0
-    k_c, k_d = _first(da > act_tol), _first(dd)
-    out = {"first_cont_step": k_c, "first_disc_step": k_d,
-           "first_cont_action": _action_name(spec.cont, int(np.argmax(da[k_c]))) if k_c >= 0 else "",
-           "first_disc_action": _action_name(spec.disc, int(np.argmax(dd[k_d]))) if k_d >= 0 else "",
-           "disc_differ_frac": float(dd.any(1).mean()) if dd.size else 0.0,
-           "first_zone_0p1k_step": _first(dz > 0.1), "first_zone_1k_step": _first(dz > 1.0),
-           "zone_max_k": float(dz.max()), "zone_mae_k": float(dz.mean()),
-           "zone_max_k_occupied": float(dz[occ].max()) if occ.any() else 0.0,
-           "zone_mae_k_occupied": float(dz[occ].mean()) if occ.any() else 0.0}
-    if k_c >= 0:  # the observations that produced the first diverging action: obs0 at step 0, else obs[k - 1]
-        o_ref = ref["obs0"] if k_c == 0 else ref["obs"][k_c - 1]
-        o_run = run["obs0"] if k_c == 0 else run["obs"][k_c - 1]
-        out["obs_err_before_first_cont"] = float(np.max(np.abs(np.asarray(o_run, dtype=np.float64)
-                                                               - np.asarray(o_ref, dtype=np.float64))))
-    z = int(np.argmax(dz.max(0)))
-    big = dz[:, z] > 1.0
-    out.update({"worst_zone": spec.zone_names[z], "worst_zone_k": float(dz[:, z].max()),
-                "worst_zone_occupied_share_of_gap": float(occ[big, z].mean()) if big.any() else 0.0,
-                "worst_zone_occupancy_mean": float(np.mean(exo.occ_rew[:n, z]))})
-    for c in ("reward", "regret", "cost", "carbon"):
-        out[f"{c}_sum_rel"] = _sum_rel(run[c][:n], ref[c][:n])
-    return out
-
-
-class NoisyPolicy:
-    """A policy that sees its observations plus Gaussian noise (normalised units) on the masked fields.
-
-    The draws depend only on the seed and the step, not on the observation, so a real and a replica run with the
-    same seed see the same noise. sigma = 0 adds exact zeros and leaves the policy's input bit-identical.
-    """
-
-    def __init__(self, policy, mask, sigma: float, seed: int):
-        self.policy, self.sigma = policy, float(sigma)
-        self.mask = np.asarray(mask, dtype=np.float64)
-        self.rng = np.random.default_rng(seed)
-
-    def get_action(self, obs):
-        obs = np.asarray(obs)
-        noise = self.sigma * self.rng.standard_normal(obs.shape) * self.mask
-        return evaluate.get_policy_action(self.policy, obs + noise.astype(obs.dtype))
-
-
-def obs_noise_mask(spec) -> np.ndarray:
-    """The observation fields the replica can get wrong: everything computed from its state ("src").
-
-    Time features, setpoints-by-schedule and the outdoor temperature come from the exogenous series and are exact
-    (T0), so they stay clean; perturbing the hour would flip the schedule, which no replica error ever does.
-    """
-    return np.array([row[0] == "src" for row in spec.obs], dtype=bool)
 
 
 def _sum_rel(pred, ref) -> float:
@@ -236,7 +163,7 @@ def check_open_loop(spec, rom, exo, tr) -> tuple[dict, dict]:
     r = _rollout(env, actions=(tr["a_cont"], tr["a_disc"]), n_steps=n)
     elec_true = tr["rw_blower"] + np.abs(tr["rw_cool"]) + tr["rw_pump"]
     zone_err = np.abs(r["zone"] - tr["zone_post"])
-    obs_err = np.abs(r["obs"] - tr["obs"])[:, obs_noise_mask(spec)]  # the fields T6 perturbs
+    obs_err = np.abs(r["obs"] - tr["obs"])[:, obs_noise_mask(spec)]  # the fields evaluate.NoisyPolicy perturbs
     return {
         "zone_max_k": float(zone_err.max()), "zone_mae_k": float(zone_err.mean()),
         "zone_max_k_by_day": [float(zone_err[i:i + 288].max()) for i in range(0, n, 288)],
@@ -259,72 +186,7 @@ def check_closed_loop(spec, rom, exo, tr, policy_name, env_real, meta, seed) -> 
     return {"score_true": true, "score_replica": rep, "score_rel": abs(rep - true) / true if true else rep,
             "steps": int(len(r["reward"])),
             "zone_max_k_vs_true": float(np.abs(r["zone"] - tr["zone_post"][:len(r["zone"])]).max()),
-            "parts_true": _score(real), "parts_replica": _score(r),
-            "divergence": _divergence(spec, exo, real, r)}, r
-
-
-def _spread(rels) -> dict:
-    v = np.asarray(rels, dtype=np.float64)
-    return {"n": int(v.size), "mean": float(v.mean()), "std": float(v.std(ddof=1)) if v.size > 1 else 0.0,
-            "max_abs": float(np.abs(v).max())}
-
-
-def check_noise_floor(config_gin, spec, rom, exo, base_real: dict, base_rep: dict, policy_name: str, seed: int,
-                      sigmas, n_seeds: int, n_steps: int, log=print) -> dict:
-    """T6: the real environment's own closed-loop spread under observation noise, and the replica's under the same draws.
-
-    Runs, all closed loop from a fresh environment, n_steps each:
-      - real, sigma = 0, once: must reproduce the traced baseline exactly (determinism of env + wrapper);
-      - for each sigma > 0 and noise seed: real and replica, the same noise draws for both.
-    Scores are relative to the traced (unperturbed) real score.
-    """
-    mask = obs_noise_mask(spec)
-    s0 = _score(base_real)["score"]
-    rel = (lambda s: (s - s0) / s0 if s0 else s)
-    runs = []
-    plan = [(0.0, 0)] + [(float(sg), k) for sg in sigmas if float(sg) > 0.0 for k in range(n_seeds)]
-    for sigma, k in plan:
-        noise_seed = 7919 * (seed + 1) + k
-        t0 = time.time()
-        env, meta = load_env(config_gin)
-        obs0 = env.reset()[0]
-        tracer = Tracer(env)
-        policy = NoisyPolicy(make_policy(policy_name, env, meta, seed), mask, sigma, noise_seed)
-        real = _traj(tracer.run(policy, obs0, n_steps))
-        tracer.detach()
-        row = {"sigma": sigma, "seed": k, "real": _score(real), "real_vs_base": _divergence(spec, exo, base_real, real),
-               "real_s": time.time() - t0}
-        row["real_rel"] = rel(row["real"]["score"])
-        if sigma > 0.0:
-            rep_env = BuildingEnv(spec, rom, exo, 1, Ops("numpy"))
-            policy = NoisyPolicy(make_policy(policy_name, env, meta, seed), mask, sigma, noise_seed)
-            rep = _rollout(rep_env, policy=policy, action_spec=env.action_spec(), n_steps=n_steps)
-            row["replica"] = _score(rep)
-            row["replica_rel"] = rel(row["replica"]["score"])
-            row["replica_vs_real"] = _divergence(spec, exo, real, rep)
-            del rep
-        runs.append(row)
-        log(f"  T6 sigma {sigma:.0e} seed {k}: real {row['real']['score']:.5f} ({row['real_rel']:+.2%})"
-            + (f" replica {row['replica']['score']:.5f} ({row['replica_rel']:+.2%})" if sigma > 0.0 else "")
-            + f" | {row['real_s']:.0f}s")
-        del env, tracer, real
-    by_sigma = {}
-    for sigma in sorted({r["sigma"] for r in runs if r["sigma"] > 0.0}):
-        rows = [r for r in runs if r["sigma"] == sigma]
-        real_rel = [r["real_rel"] for r in rows]
-        rep_rel = [r["replica_rel"] for r in rows]
-        pair = [r["replica_rel"] - r["real_rel"] for r in rows]
-        by_sigma[f"{sigma:.0e}"] = {
-            "real_rel": _spread(real_rel), "replica_rel": _spread(rep_rel), "paired_gap": _spread(pair),
-            "ensemble_gap_rel": float(np.mean(rep_rel) - np.mean(real_rel)),
-            "ensemble_gap_se": float(np.sqrt(np.var(real_rel, ddof=1) / len(rows) + np.var(rep_rel, ddof=1) / len(rows)))
-            if len(rows) > 1 else 0.0}
-    det = runs[0]
-    return {"mask_fields": int(mask.sum()), "n_obs": int(mask.size), "baseline_score": s0,
-            "replica_unperturbed_rel": rel(_score(base_rep)["score"]),
-            "determinism": {"score_rel": det["real_rel"], "zone_max_k": det["real_vs_base"]["zone_max_k"],
-                            "first_cont_step": det["real_vs_base"]["first_cont_step"]},
-            "by_sigma": by_sigma, "runs": runs}
+            "parts_true": _score(real), "parts_replica": _score(r)}, r
 
 
 def check_torch(spec, rom, exo, tr, ref: dict, n_steps: int) -> dict:
@@ -374,7 +236,7 @@ def check_torch(spec, rom, exo, tr, ref: dict, n_steps: int) -> dict:
 
 
 def run_env_check(config_gin: Path, out_dir: Path, policies=("pid_water",), steps=(576,), torch_steps: int = 576,
-                  seed: int = 0, noise_sigmas=(), noise_seeds: int = 3, log=print) -> dict:
+                  seed: int = 0, log=print) -> dict:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     t_start = time.time()
@@ -407,10 +269,6 @@ def run_env_check(config_gin: Path, out_dir: Path, policies=("pid_water",), step
         res["T4"], closed = check_closed_loop(spec, rom, exo, tr, name, env, meta, seed)
         res["T5"] = check_torch(spec, rom, exo, tr, replica, torch_steps) if torch_steps > 0 else {"skipped": "off"}
         report["policies"][name] = res
-        (out_dir / "report.json").write_text(json.dumps(report, indent=1, default=str))
-        if noise_sigmas and name != "excite":  # excite never reads its observations
-            res["T6"] = check_noise_floor(config_gin, spec, rom, exo, _traj(tr), closed, name, seed, noise_sigmas,
-                                          noise_seeds, res["steps"], log=log)
         res["seconds"] = time.time() - t0
         t3, t4 = res["T3"], res["T4"]
         log(f"  {name}: T1 reward {res['T1']['reward']['max_abs']:.1e} obs {res['T1']['obs']['max_abs']:.1e} | "
@@ -431,13 +289,10 @@ def main() -> None:
     ap.add_argument("--steps", default="576", help="steps per policy (one value, or one per policy)")
     ap.add_argument("--torch-steps", type=int, default=576)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--noise-sigmas", default="", help="T6: comma-separated observation-noise levels, e.g. 1e-6,1e-4")
-    ap.add_argument("--noise-seeds", type=int, default=3, help="T6: noise draws per level")
     a = ap.parse_args()
     run_env_check(a.config, a.out_dir, policies=tuple(a.policies.split(",")),
                   steps=tuple(int(s) for s in a.steps.split(",")), torch_steps=a.torch_steps, seed=a.seed,
-                  noise_sigmas=tuple(float(s) for s in a.noise_sigmas.split(",") if s),
-                  noise_seeds=a.noise_seeds, log=lambda s: print(s, flush=True))
+                  log=lambda s: print(s, flush=True))
 
 
 if __name__ == "__main__":
