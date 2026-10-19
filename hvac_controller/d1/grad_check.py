@@ -4,13 +4,16 @@ Open loop (no policy yet), torch, no protobuf float32 emulation (the training co
 window of h steps is J = the summed reward of each batch row. Per scenario the replica is first run for a day of
 structured random actions (trace.ExcitePolicy, no gradients); windows then start from that state at 00:00 and from
 the state 6 h later (06:00, when the schedule switches to comfort). Window actions are another ExcitePolicy sequence,
-continuous ones kept within [-0.8, 0.8] so that small perturbations never reach the [-1, 1] bounds. Two modes:
+continuous ones mapped to 0.7 a + U(-0.05, 0.05): inside [-0.75, 0.75] and off every device threshold (see _base).
+Two modes:
 "relaxed" (exact=False, run commands 0.1 / 0.9 and differentiable) and "exact" (run commands fixed at 0 / 1).
 
 E1 correct (float64): autograd directional derivatives dJ/da . v against central differences (eps 1e-4 and 1e-6,
    the better one kept), for 8 random unit directions over every action of the window and one per action group;
    error |FD - AD| / ||grad J|| (|v| = 1), so a direction that happens to be nearly orthogonal to the gradient does
-   not inflate it.
+   not inflate it. The one-sided differences flag a direction whose perturbation crosses a kink (min / max / clamp):
+   there the difference quotient is not a derivative, so the error is also reported without those directions. And
+   the same window's autograd gradient in float32 (the training dtype) against float64.
 E2 through time (float64, h = 288): ||dJ/da_k|| by lag from the window's end, in total and per action group.
 E3 usable (float32, B rows): each row has its own constant action offset theta_i (zero) and exploration noise
    sigma xi_i. First order (FO): the per-row gradients dJ_i/dtheta_i, one backward pass. Zeroth order (ZO): the score
@@ -36,6 +39,7 @@ STARTS = {"00:00": 288, "06:00": 360}  # warm-up steps before the window
 H_MAX = 288
 LAGS = (0, 1, 3, 12, 36, 72, 144, 287)
 EPS = (1e-4, 1e-6)
+KINK = 1e-3  # |forward - backward difference| / ||grad J|| above this: the perturbation crossed a kink
 N_RANDOM = 8
 GROUPS = ("ahu_sp", "ahu_p", "ahu_r", "w_sp", "w_dp", "damper", "valve")
 
@@ -67,9 +71,12 @@ def _warm(spec, rom, exo, device: str, a_c, a_d) -> dict:
     return {"state": {k: v.detach().clone() for k, v in env.state.items()}, "k": env.k}
 
 
-def _base(a_c: np.ndarray, a_d: np.ndarray, relaxed: bool):
-    """Window actions: continuous clipped to [-0.8, 0.8]; run commands 0.1 / 0.9 when relaxed, else 0 / 1."""
-    return np.clip(a_c, -0.8, 0.8), (0.1 + 0.8 * a_d if relaxed else a_d)
+def _base(a_c: np.ndarray, a_d: np.ndarray, relaxed: bool, rng):
+    """Window actions. Continuous: 0.7 a + U(-0.05, 0.05), so no value sits on a device threshold. Normalised -0.8 is
+    exactly the damper floor (0.1) and the static-pressure floor (200 Pa of 0-2000): the first run of notebook 14
+    (2026-10-19) clipped ExcitePolicy's bound actions to -0.8, and its finite differences straddled those kinks.
+    Run commands: 0.1 / 0.9 when relaxed, else 0 / 1."""
+    return 0.7 * a_c + rng.uniform(-0.05, 0.05, a_c.shape), (0.1 + 0.8 * a_d if relaxed else a_d)
 
 
 def _directions(spec, h: int, relaxed: bool, rng) -> list[tuple[str, np.ndarray, np.ndarray]]:
@@ -88,22 +95,28 @@ def _directions(spec, h: int, relaxed: bool, rng) -> list[tuple[str, np.ndarray,
     return [(name, vc / s, vd / s) for (name, vc, vd), s in zip(out, norm)]
 
 
-def fd_report(dirs, j: np.ndarray, g_c: np.ndarray, g_d: np.ndarray) -> dict:
-    """E1 from the autograd gradient (g_c, g_d) and the perturbed objectives j (n_dirs * len(EPS) * 2, in the order
-    direction, eps, +/-)."""
+def fd_report(dirs, j0: float, j: np.ndarray, g_c: np.ndarray, g_d: np.ndarray) -> dict:
+    """E1 from the autograd gradient (g_c, g_d), the unperturbed objective j0 and the perturbed ones j
+    (n_dirs * len(EPS) * 2, in the order direction, eps, +/-)."""
     g_norm = float(np.sqrt((g_c ** 2).sum() + (g_d ** 2).sum()))
     j = np.asarray(j, dtype=np.float64).reshape(len(dirs), len(EPS), 2)
-    fd = (j[..., 0] - j[..., 1]) / (2.0 * np.asarray(EPS))
+    eps = np.asarray(EPS)
+    fwd, bwd = (j[..., 0] - j0) / eps, (j0 - j[..., 1]) / eps
+    fd = 0.5 * (fwd + bwd)
     errors = {}
     for i, (name, vc, vd) in enumerate(dirs):
         ad = float((g_c * vc).sum() + (g_d * vd).sum())
         err = np.abs(fd[i] - ad) / g_norm
         best = int(np.argmin(err))
-        errors[name] = {"ad": ad, "fd": float(fd[i, best]), "err": float(err[best]), "eps": EPS[best]}
+        errors[name] = {"ad": ad, "fd": float(fd[i, best]), "err": float(err[best]), "eps": EPS[best],
+                        "err_by_eps": err.tolist(), "kink": bool(abs(fwd[i, best] - bwd[i, best]) / g_norm > KINK)}
     all_err = np.array([e["err"] for e in errors.values()])
+    smooth = np.array([e["err"] for e in errors.values() if not e["kink"]])
     return {"grad_norm": g_norm, "grad_finite": bool(np.isfinite(g_c).all() and np.isfinite(g_d).all()),
             "err_median": float(np.median(all_err)), "err_max": float(all_err.max()),
-            "share_above_1e-3": float(np.mean(all_err > 1e-3)), "directions": errors}
+            "share_above_1e-3": float(np.mean(all_err > 1e-3)), "n_kink": int(len(all_err) - len(smooth)),
+            "err_median_smooth": float(np.median(smooth)) if smooth.size else None,
+            "err_max_smooth": float(smooth.max()) if smooth.size else None, "directions": errors}
 
 
 def lag_report(spec, g_c: np.ndarray, g_d: np.ndarray, relaxed: bool) -> dict:
@@ -122,23 +135,36 @@ def lag_report(spec, g_c: np.ndarray, g_d: np.ndarray, relaxed: bool) -> dict:
     return out
 
 
-def check_fd(spec, rom, exo, start, base_c, base_d, relaxed: bool, device: str, seed: int) -> tuple[dict, dict]:
-    """E1 on one window, and E2 from the same autograd pass (float64)."""
-    h = len(base_c)
-    t = (lambda x: torch.as_tensor(x, dtype=torch.float64, device=device))
-    env = _env_at(spec, rom, exo, start, 1, device, torch.float64, exact=not relaxed)
+def _autograd(spec, rom, exo, start, base_c, base_d, relaxed: bool, device: str, dtype) -> tuple[np.ndarray, np.ndarray]:
+    """dJ/da of one row over the window, as float64 arrays (h, 1, n_cont) and (h, 1, n_disc)."""
+    t = (lambda x: torch.as_tensor(x, dtype=dtype, device=device))
+    env = _env_at(spec, rom, exo, start, 1, device, dtype, exact=not relaxed)
     a_c = t(base_c[:, None]).requires_grad_(True)
     a_d = t(base_d[:, None]).requires_grad_(relaxed)
     _window(env, a_c, a_d).sum().backward()
-    g_c = a_c.grad.cpu().numpy()
-    g_d = a_d.grad.cpu().numpy() if relaxed else np.zeros_like(base_d[:, None])
+    g_d = a_d.grad if relaxed else torch.zeros_like(a_d)
+    return a_c.grad.double().cpu().numpy(), g_d.double().cpu().numpy()
+
+
+def check_fd(spec, rom, exo, start, base_c, base_d, relaxed: bool, device: str, seed: int) -> tuple[dict, dict]:
+    """E1 on one window, and E2 from the same (float64) autograd pass."""
+    h = len(base_c)
+    g_c, g_d = _autograd(spec, rom, exo, start, base_c, base_d, relaxed, device, torch.float64)
+    f_c, f_d = _autograd(spec, rom, exo, start, base_c, base_d, relaxed, device, torch.float32)
+    g64, g32 = np.concatenate([g_c.ravel(), g_d.ravel()]), np.concatenate([f_c.ravel(), f_d.ravel()])
     dirs = _directions(spec, h, relaxed, np.random.default_rng(seed))
-    rows_c = [base_c[:, None] + sign * eps * vc for _, vc, _ in dirs for eps in EPS for sign in (1.0, -1.0)]
-    rows_d = [base_d[:, None] + sign * eps * vd for _, _, vd in dirs for eps in EPS for sign in (1.0, -1.0)]
+    rows_c = [base_c[:, None]] + [base_c[:, None] + sign * eps * vc for _, vc, _ in dirs for eps in EPS
+                                  for sign in (1.0, -1.0)]
+    rows_d = [base_d[:, None]] + [base_d[:, None] + sign * eps * vd for _, _, vd in dirs for eps in EPS
+                                  for sign in (1.0, -1.0)]
+    t = (lambda x: torch.as_tensor(x, dtype=torch.float64, device=device))
     env = _env_at(spec, rom, exo, start, len(rows_c), device, torch.float64, exact=not relaxed)
     with torch.no_grad():
         j = _window(env, t(np.concatenate(rows_c, 1)), t(np.concatenate(rows_d, 1))).cpu().numpy()
-    return {"h": h, **fd_report(dirs, j, g_c, g_d)}, lag_report(spec, g_c, g_d, relaxed)
+    e1 = {"h": h, **fd_report(dirs, float(j[0]), j[1:], g_c, g_d),
+          "float32": {"cos": _cos(g32, g64), "rel": float(np.linalg.norm(g32 - g64) / np.linalg.norm(g64)),
+                      "finite": bool(np.isfinite(g32).all())}}
+    return e1, lag_report(spec, g_c, g_d, relaxed)
 
 
 def _stats(per_row: np.ndarray) -> tuple[dict, np.ndarray]:
@@ -218,7 +244,8 @@ def run_grad_check(config_gin: Path, out_dir: Path, device: str, fd_windows, var
         for relaxed in (True, False):
             mode = "relaxed" if relaxed else "exact"
             for h in fd_windows:
-                bc, bd = _base(a_c[n_warm:n_warm + h, 1], a_d[n_warm:n_warm + h, 1], relaxed)
+                bc, bd = _base(a_c[n_warm:n_warm + h, 1], a_d[n_warm:n_warm + h, 1], relaxed,
+                               np.random.default_rng(10 * s_i + h))
                 e1, e2 = check_fd(spec, rom, exo, start, bc, bd, relaxed, device, seed=100 * s_i + h)
                 res["E1"][f"{mode}_h{h}"] = e1
                 if h == max(fd_windows):
@@ -226,7 +253,8 @@ def run_grad_check(config_gin: Path, out_dir: Path, device: str, fd_windows, var
                 log(f"  {label} {mode} h={h}: E1 err median {e1['err_median']:.1e} max {e1['err_max']:.1e} "
                     f"(|grad| {e1['grad_norm']:.2e}, finite {e1['grad_finite']})")
             for h in var_windows:
-                bc, bd = _base(a_c[n_warm:n_warm + h, 1], a_d[n_warm:n_warm + h, 1], relaxed)
+                bc, bd = _base(a_c[n_warm:n_warm + h, 1], a_d[n_warm:n_warm + h, 1], relaxed,
+                               np.random.default_rng(10 * s_i + h))
                 e3 = check_variance(spec, rom, exo, start, bc, bd, relaxed, device, B, sigma, seed=1000 * s_i + h)
                 res["E3"][f"{mode}_h{h}"] = e3
                 log(f"  {label} {mode} h={h}: E3 FO snr {e3['fo']['snr']:.1f} ZO snr {e3['zo']['snr']:.2f} "

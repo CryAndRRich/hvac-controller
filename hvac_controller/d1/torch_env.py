@@ -131,6 +131,9 @@ class BuildingEnv:
         self.state = None
         if compile_backend:  # torch only: the step body as one compiled graph (fuses the plant's elementwise ops)
             self._advance = o.torch.compile(self._advance, backend=compile_backend)
+        # CUDA-graph replays reuse their output buffers, so the state, observation and reward that outlive a step are
+        # copied (only those: the other outputs in extras["post"] are valid until the next step).
+        self._own_outputs = compile_backend == "cudagraphs"
 
     # ---- episode ----------------------------------------------------------------------------------------------
     def reset(self):
@@ -146,6 +149,9 @@ class BuildingEnv:
         o, k = self.o, self.k
         e = {name: v[k] for name, v in self.exo.items()}
         self.state, out = self._advance(self.state, o.asarray(a_cont), o.asarray(a_disc), e, self.obs_exo[k + 1])
+        if self._own_outputs:
+            self.state = {name: v.clone() for name, v in self.state.items()}
+            out = {**out, "obs": out["obs"].clone(), "reward": out["reward"].clone()}
         self.k = k + 1
         self.obs = out["obs"]
         return out["obs"], out["reward"], self.k >= self.episode_steps, {"post": out, "y": self.state["y"]}
