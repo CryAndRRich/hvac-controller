@@ -4,12 +4,14 @@ The closed loop is chaotic around on/off decisions (D1 doc §2.7): Gaussian nois
 state observations moves a 30-day score by up to 6.6 % in hot and humid climates. So a policy is scored by an
 ensemble: seed 0 sees its observations as they are, seed k >= 1 sees them plus noise of SIGMA drawn from seed k
 (``NoisyPolicy``). The baseline's ensemble is the null group; a candidate is judged per scenario by
-z = (its mean - null mean) / null sd.
+z = (its mean - null mean) / sd (``compare``).
 
 Every run is one job, written to its own JSON file as soon as it finishes, so a long sharded evaluation can be
 restarted and skips what is done. Jobs run in fresh processes (the simulator keeps gin and occupancy state).
 
-Policies by name: ``k10`` (the baseline, hvac_controller.baseline_k10) or any key of the starter kit's POLICY_MAP.
+Policies by name: ``k10`` (the baseline, hvac_controller.baseline_k10), ``trained:<path>`` (policy.KagglePolicy with
+the weights at path; in job file names the path becomes its parent folder's name) or any key of the starter kit's
+POLICY_MAP.
 """
 
 from __future__ import annotations
@@ -63,6 +65,10 @@ def make_policy(name: str, meta: dict, action_spec, spec, seed: int):
         from hvac_controller.baseline_k10 import SubmissionPolicy
 
         policy = SubmissionPolicy(meta, action_spec)
+    elif name.startswith("trained:"):
+        from hvac_controller.d1.policy import KagglePolicy
+
+        policy = KagglePolicy(meta, action_spec, weights=Path(name.split(":", 1)[1]))
     else:
         policy = evaluate.initialize_policy(evaluate.POLICY_MAP[name], meta, action_spec)
     return policy if seed == 0 else NoisyPolicy(policy, obs_noise_mask(spec), SIGMA, seed)
@@ -134,8 +140,12 @@ def run_replica(cache: str, policy: str, seed: int, n_steps: int) -> dict:
     return _summary(rewards, terms, time.time() - t0, policy_s)
 
 
+def policy_tag(name: str) -> str:
+    return Path(name.split(":", 1)[1]).parent.name if name.startswith("trained:") else name
+
+
 def job_name(job: dict) -> str:
-    return f"{job['where']}__{job['scenario'].replace('/', '__')}__{job['policy']}__s{job['seed']}"
+    return f"{job['where']}__{job['scenario'].replace('/', '__')}__{policy_tag(job['policy'])}__s{job['seed']}"
 
 
 def _run_job(job: dict) -> dict:
@@ -171,7 +181,7 @@ def ensembles(results: list[dict]) -> dict:
     groups: dict = {}
     for r in results:
         if "error" not in r:
-            groups.setdefault((r["where"], r["scenario"], r["policy"]), []).append(r)
+            groups.setdefault((r["where"], r["scenario"], policy_tag(r["policy"])), []).append(r)
     out = {}
     for key, rows in groups.items():
         s = np.array([r["score"] for r in rows])
@@ -180,16 +190,18 @@ def ensembles(results: list[dict]) -> dict:
     return out
 
 
-def compare(ens: dict, candidate: str, null: str, where: str = "original") -> dict:
-    """Per scenario both are scored on: relative gap of the means and z against the null group's spread."""
+def compare(ens: dict, candidate: str, null: str, where: str = "original", sd_floor: float = 0.005) -> dict:
+    """Per scenario both are scored on: relative gap of the means and z = gap / sd, sd from both ensembles' spreads
+    with a floor of sd_floor x the null mean. K10 hardly moves under observation noise (notebook 20: sd 0 on 27 of 30
+    scenarios), and the replica scores it within 0.7 %; the floor keeps z from dividing by zero."""
     out = {}
     for (w, scenario, policy), c in ens.items():
         b = ens.get((w, scenario, null))
         if w != where or policy != candidate or b is None:
             continue
+        sd = max(float(np.hypot(c["sd"], b["sd"])), sd_floor * b["mean"])
         out[scenario] = {"candidate": c["mean"], "null": b["mean"], "rel": (c["mean"] - b["mean"]) / b["mean"],
-                         "z": (c["mean"] - b["mean"]) / b["sd"] if b["sd"] > 0.0 else float("nan"),
-                         "null_sd_rel": b["sd"] / b["mean"], "n": (c["n"], b["n"])}
+                         "z": (c["mean"] - b["mean"]) / sd, "sd_rel": sd / b["mean"], "n": (c["n"], b["n"])}
     if out:
         out["mean"] = {"candidate": float(np.mean([v["candidate"] for v in out.values()])),
                        "null": float(np.mean([v["null"] for v in out.values()]))}

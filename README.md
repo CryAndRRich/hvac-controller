@@ -84,10 +84,13 @@ hvac_controller/            # our own code, kept apart from the starter kit
   d1/env_check.py           # replica vs original, tiers T0-T5: the regression check for any change to the replica
   d1/cache.py               # step 6: one scenario's replica inputs (spec, ROM, exogenous, metadata), pickled once
   d1/evaluate.py            # step 6: score policies in the original and the replica over noise ensembles (null groups)
+  d1/policy.py              # step 6: size-agnostic supervisory policy (+ differentiable PI); KagglePolicy for submission
+  d1/train.py               # step 6: SHAC through the replica (critic, CUDA graph windows, replica scoring, checkpoints)
 notebooks/                  # Kaggle notebooks only; each clones this repo and calls hvac_controller
   00_probe.ipynb            # runs probes.py
   12_d1_env_check.ipynb     # runs d1/env_check.py: MODE debug (3 scenarios x 2 days) or gate (30 x 30 days, sharded)
   20_d1_cache.ipynb         # caches + K10 null group (original and replica): MODE pilot (atlanta_2) or all (sharded)
+  21_d1_train.ipynb         # GPU T4 x2: smoke checks, training runs, best runs scored in the original vs K10
 ```
 
 ## Install
