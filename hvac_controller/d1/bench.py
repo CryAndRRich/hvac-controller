@@ -7,16 +7,18 @@ For one scenario, after building the replica once (torch_env.replica_from_env):
    NumPy float64 replica with the exact LU air solve (as validated against the original in step C) against torch
    float64 and float32 on the device with the default (Jacobi) air solve; and batch rows against a single run with
    the same actions (batch independence);
-3. forward: steps per second without gradients at each batch size, eager and, if asked, torch.compile'd;
+3. forward: steps per second without gradients at each batch size;
 4. forward + backward: gradient windows of h steps on the relaxed plant (exact=False), loss = summed reward,
    actions as leaf tensors; env-steps per second, peak device memory, finite gradients;
 5. breakdown: device time of the ROM step (and of its air solve, Jacobi against LU), plant.pre and plant.post at one
    batch size; and the Jacobi spectral radius actually met, against the bound the sweep count is set from;
-6. compile diagnostics (with --compile): one gradient window compiled with aot_eager (no Inductor) and with Inductor,
-   against eager: rewards, and which gradients are non-finite where.
+6. compile (--compile VARIANTS): per variant of COMPILE_VARIANTS, one gradient window against eager (rewards, and
+   which gradients are non-finite where), forward speed, and forward + backward speed at the first window length.
 
-Compiled runs reset dynamo before each environment: the cache is per code object, so every new environment
-recompiles ``_advance``, and past the recompile limit torch would quietly fall back to eager.
+``--parts`` picks which of accuracy, forward, backward, breakdown and compile run. Compiled runs reset dynamo before
+each environment: the cache is per code object, so every new environment recompiles ``_advance``, and past the
+recompile limit torch would quietly fall back to eager. CUDA-graph runs mark a new step before every forward-only
+step and every gradient window, so a replay never overwrites outputs that are still needed.
 """
 
 from __future__ import annotations
@@ -39,21 +41,32 @@ from hvac_controller.sim import load_env
 
 ACC_ROWS = 8  # action sequences compared with the NumPy reference
 ACC_BATCH = 64  # batch the device runs them in (rows ACC_ROWS.. are other seeds)
-# Inductor settings tried for the compiled backward. On a T4, torch 2.11 (2026-10-18) the default failed in Triton and
-# persistent reductions off compiled on two of three buildings but gave non-finite gradients.
-NO_PERSISTENT = {"triton.persistent_reductions": False}
-COMPILE_VARIANTS = {"compiled": {}, "compiled_no_persistent": NO_PERSISTENT}
+PARTS = ("accuracy", "forward", "backward", "breakdown", "compile")
+# name -> (torch.compile backend, Inductor config). On a T4, torch 2.11 (2026-10-18/19) Inductor's default failed in
+# Triton, and with persistent reductions off it compiled on two of three buildings but gave non-finite gradients;
+# aot_eager reproduced eager exactly. cudagraphs runs aot_eager's graph through CUDA graphs (no Triton).
+COMPILE_VARIANTS = {"aot_eager": ("aot_eager", {}), "inductor": ("inductor", {}),
+                    "inductor_no_persistent": ("inductor", {"triton.persistent_reductions": False}),
+                    "cudagraphs": ("cudagraphs", {})}
 
 
 def _failure(e: Exception) -> dict:
     return {"error": f"{type(e).__name__}: {str(e)[:300]}", "detail": traceback.format_exc()[-6000:]}
 
 
-def _new_env(spec, rom, exo, B: int, device: str, backend: str | None = None, **kw) -> BuildingEnv:
+def _new_env(spec, rom, exo, B: int, device: str, backend: str | None = None, dtype=torch.float32,
+             **kw) -> BuildingEnv:
+    """The training configuration: torch, no protobuf float32 emulation, optionally compiled."""
     if backend:
         torch._dynamo.reset()
-    return BuildingEnv(spec, rom, exo, B, Ops("torch", dtype=torch.float32, device=device), emulate_f32=False,
+    return BuildingEnv(spec, rom, exo, B, Ops("torch", dtype=dtype, device=device), emulate_f32=False,
                        compile_backend=backend, **kw)
+
+
+def _mark(backend: str | None) -> None:
+    """Start a new CUDA-graph step: outputs of earlier replays may be overwritten from here on."""
+    if backend == "cudagraphs":
+        torch.compiler.cudagraph_mark_step_begin()
 
 
 def _inductor_patch(opts: dict):
@@ -135,14 +148,17 @@ def forward_speed(spec, rom, exo, device: str, batches, n_steps: int = 288, back
             with torch.no_grad():
                 env.reset()
                 t0 = time.time()
+                _mark(backend)
                 env.step(a_c[0], a_d[0])  # includes compilation when compiled
                 _sync(device)
                 first = time.time() - t0
                 for k in range(1, 10):
+                    _mark(backend)
                     env.step(a_c[k % 16], a_d[k % 16])
                 _sync(device)
                 t0 = time.time()
                 for k in range(n_steps):
+                    _mark(backend)
                     env.step(a_c[k % 16], a_d[k % 16])
                 _sync(device)
                 dt = time.time() - t0
@@ -168,6 +184,7 @@ def _backward_once(spec, rom, exo, device: str, B: int, h: int, n_windows: int, 
         a_d = a_d.clamp(0.05, 0.95).requires_grad_(True)  # relaxed run commands
         _sync(device)
         t0 = time.time()
+        _mark(backend)
         total = 0.0
         for k in range(h):
             _, r, _, _ = env.step(a_c[k], a_d[k])
@@ -265,8 +282,8 @@ def breakdown(spec, rom, exo, device: str, B: int) -> dict:
                 "solve_diag": solve_diagnostics(rom, o.to_numpy(g[:64]), pl.max_air_conductance())}
 
 
-def compile_diagnostics(spec, rom, exo, device: str, B: int = 64, h: int = 8) -> dict:
-    """One identical gradient window, eager against compiled: where do the compiled gradients go non-finite?
+def compile_diagnostics(spec, rom, exo, device: str, variants, B: int = 64, h: int = 8) -> dict:
+    """One identical gradient window, eager against each compiled variant: where do its gradients go non-finite?
 
     aot_eager traces and decomposes like Inductor but runs the decomposed ops eagerly, so a failure there is in the
     graph and its decompositions, a failure only under Inductor is in the generated kernels.
@@ -277,6 +294,7 @@ def compile_diagnostics(spec, rom, exo, device: str, B: int = 64, h: int = 8) ->
     def window(backend):
         env = _new_env(spec, rom, exo, B, device, backend, exact=False)
         env.reset()
+        _mark(backend)
         a_c = (a_c0 * 0.9).requires_grad_(True)
         a_d = a_d0.clamp(0.05, 0.95).requires_grad_(True)
         rewards, total = [], 0.0
@@ -289,7 +307,8 @@ def compile_diagnostics(spec, rom, exo, device: str, B: int = 64, h: int = 8) ->
 
     rew0, gc0, gd0 = window(None)
     out = {"B": B, "h": h, "eager_grad_finite": bool(torch.isfinite(gc0).all() and torch.isfinite(gd0).all())}
-    for name, backend, opts in (("aot_eager", "aot_eager", {}), ("inductor_no_persistent", "inductor", NO_PERSISTENT)):
+    for name in variants:
+        backend, opts = COMPILE_VARIANTS[name]
         try:
             with _inductor_patch(opts):
                 rew, gc, gd = window(backend)
@@ -309,15 +328,18 @@ def compile_diagnostics(spec, rom, exo, device: str, B: int = 64, h: int = 8) ->
 
 
 def run_bench(config_gin: Path, out_dir: Path, device: str, batches, windows, back_batches, n_steps: int,
-              compile_step: bool, log=print) -> dict:
+              parts=PARTS, variants=(), log=print) -> dict:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     torch.backends.cuda.matmul.allow_tf32 = False  # keep float32 matmuls float32 on GPUs that have TF32
-    report = {"config": str(config_gin), "torch": torch.__version__, "device": device,
+    report = {"config": str(config_gin), "torch": torch.__version__, "device": device, "parts": list(parts),
               "device_name": torch.cuda.get_device_name() if device.startswith("cuda") else "cpu"}
 
     def save():
         (out_dir / "report.json").write_text(json.dumps(report, indent=1, default=str))
+
+    def rates(res):
+        return " ".join(f"{k}:{v.get('env_steps_per_s', 0):.0f}/s" for k, v in res.items())
 
     t0 = time.time()
     env, _ = load_env(config_gin)
@@ -329,34 +351,35 @@ def run_bench(config_gin: Path, out_dir: Path, device: str, batches, windows, ba
     log(f"[bench] {spec.label}: Z={spec.n_zones} V={spec.n_vavs} r={rom.order} on {report['device_name']} | setup "
         f"load {load_s:.0f}s spec {build['spec_s']:.0f}s ROM {build['rom_s']:.0f}s exo {build['exo_s']:.0f}s")
     save()
-
-    report["accuracy"] = check_accuracy(spec, rom, exo, env.action_spec(), device, n_steps, log=log)
-    save()
-    report["forward"] = forward_speed(spec, rom, exo, device, batches)
-    log("  forward " + " ".join(f"B{b}:{v.get('env_steps_per_s', 0):.0f}/s" for b, v in report["forward"].items()))
-    save()
-    report["backward"] = backward_speed(spec, rom, exo, device, back_batches, windows)
-    log("  backward " + " ".join(f"{k}:{v.get('env_steps_per_s', 0):.0f}/s" for k, v in report["backward"].items()))
-    save()
-    report["breakdown"] = breakdown(spec, rom, exo, device, 1024)
-    log(f"  breakdown B1024: {report['breakdown']}")
-    save()
-    if compile_step:
-        report["compile_diagnostics"] = compile_diagnostics(spec, rom, exo, device)
+    if "accuracy" in parts:
+        report["accuracy"] = check_accuracy(spec, rom, exo, env.action_spec(), device, n_steps, log=log)
+        save()
+    if "forward" in parts:
+        report["forward"] = forward_speed(spec, rom, exo, device, batches)
+        log("  forward " + rates(report["forward"]))
+        save()
+    if "backward" in parts:
+        report["backward"] = backward_speed(spec, rom, exo, device, back_batches, windows)
+        log("  backward " + rates(report["backward"]))
+        save()
+    if "breakdown" in parts:
+        report["breakdown"] = breakdown(spec, rom, exo, device, 1024)
+        log(f"  breakdown B1024: {report['breakdown']}")
+        save()
+    if "compile" in parts and variants:
+        report["compile_diagnostics"] = compile_diagnostics(spec, rom, exo, device, variants)
         log(f"  compile diagnostics: {json.dumps(report['compile_diagnostics'], default=str)[:1500]}")
         save()
-        report["forward_compiled"] = forward_speed(spec, rom, exo, device, batches, backend="inductor")
-        log("  forward compiled " + " ".join(f"B{b}:{v.get('env_steps_per_s', 0):.0f}/s"
-                                            for b, v in report["forward_compiled"].items()))
-        save()
-        for name, opts in COMPILE_VARIANTS.items():
+        for name in variants:
+            backend, opts = COMPILE_VARIANTS[name]
             try:  # an unknown config key must not end the bench
                 with _inductor_patch(opts):
-                    res = backward_speed(spec, rom, exo, device, back_batches, windows[:1], backend="inductor")
+                    fwd = forward_speed(spec, rom, exo, device, batches, backend=backend)
+                    bwd = backward_speed(spec, rom, exo, device, back_batches, windows[:1], backend=backend)
             except Exception as e:
-                res = {"setup": _failure(e)}
-            report[f"backward_{name}"] = res
-            log(f"  backward {name} " + " ".join(f"{k}:{v.get('env_steps_per_s', 0):.0f}/s" for k, v in res.items()))
+                fwd, bwd = {"setup": _failure(e)}, {}
+            report[f"forward_{name}"], report[f"backward_{name}"] = fwd, bwd
+            log(f"  {name}: forward {rates(fwd)} | backward {rates(bwd)}")
             save()
     return report
 
@@ -370,11 +393,17 @@ def main() -> None:
     ap.add_argument("--back-batches", default="64,256,1024,2048,4096", help="forward + backward batch sizes")
     ap.add_argument("--windows", default="32,128", help="gradient window lengths h")
     ap.add_argument("--steps", type=int, default=8640, help="episode length for the accuracy check")
-    ap.add_argument("--compile", action="store_true", help="also time the torch.compile'd step")
+    ap.add_argument("--parts", default=",".join(PARTS), help="comma-separated subset of " + ",".join(PARTS))
+    ap.add_argument("--compile", default="", help="comma-separated compile variants: " + ",".join(COMPILE_VARIANTS))
     a = ap.parse_args()
     ints = (lambda s: tuple(int(v) for v in s.split(",") if v))
+    words = (lambda s: tuple(v for v in s.split(",") if v))
+    parts, variants = words(a.parts), words(a.compile)
+    unknown = (set(parts) - set(PARTS)) | (set(variants) - set(COMPILE_VARIANTS))
+    if unknown:
+        ap.error(f"unknown parts or compile variants: {sorted(unknown)}")
     run_bench(a.config, a.out_dir, a.device, ints(a.batches), ints(a.windows), ints(a.back_batches), a.steps,
-              a.compile, log=lambda s: print(s, flush=True))
+              parts, variants, log=lambda s: print(s, flush=True))
 
 
 if __name__ == "__main__":

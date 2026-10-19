@@ -81,13 +81,15 @@ hvac_controller/            # our own code, kept apart from the starter kit
   d1/torch_env.py           # step C: BuildingEnv = ROM + plant, batched, NumPy or PyTorch; replica_from_env builds it
   d1/trace.py               # step C: ground-truth tracer for the organisers' env; structured random policy
   d1/env_check.py           # step C: replica vs original, tiers T0-T5, T6 noise floor (real env vs itself)
-  d1/bench.py               # step D: float32 accuracy, forward / backward speed and memory on a GPU
+  d1/bench.py               # step D: float32 accuracy, forward / backward speed and memory on a GPU; compile variants
+  d1/grad_check.py          # step 5: gradients vs finite differences, by lag, first- vs zeroth-order variance
 notebooks/                  # Kaggle notebooks only; each clones this repo and calls hvac_controller
   00_probe.ipynb            # runs probes.py
   10_d1_core_check.ipynb    # runs d1/core.py on three scenarios, swap off and on
   11_d1_rom_check.ipynb     # self-contained: baseline rollout + core (d1/core.py), then d1/rom.py, three scenarios in parallel
   12_d1_env_check.ipynb     # runs d1/env_check.py: MODE debug (3 scenarios x 2 days), gate (30 x 30 days, sharded) or noise (T6, 9 scenarios)
   13_d1_speed.ipynb         # runs d1/bench.py on a T4 GPU, three scenarios one after the other
+  14_d1_grad_check.ipynb    # runs d1/grad_check.py and bench.py's cudagraphs variant on a T4, three scenarios
 ```
 
 ## Install
