@@ -323,7 +323,7 @@ class Trainer:
                 v = torch.where(d["done"], torch.zeros_like(v), v)
                 G = td_lambda(d["r"], d["done"], v, cfg.gamma, cfg.lam)
                 sets.append((d["vav"][:-1].flatten(0, 1), d["glob"][:-1].flatten(0, 1), G.flatten()))
-        total = 0.0
+        total = torch.zeros((), device=self.device)
         for _ in range(cfg.critic_iters):
             for X_v, X_g, Y in sets:
                 for idx in torch.randperm(len(Y), device=self.device).chunk(cfg.critic_batches):
@@ -332,11 +332,11 @@ class Trainer:
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.critic.parameters(), cfg.clip)
                     self.opt_c.step()
-                    total += float(loss)
+                    total += loss.detach()
         with torch.no_grad():
             for t, c in zip(self.target.parameters(), self.critic.parameters()):
                 t.mul_(cfg.target_keep).add_(c, alpha=1.0 - cfg.target_keep)
-        return (total / (cfg.critic_iters * cfg.critic_batches * len(sets)),
+        return (float(total) / (cfg.critic_iters * cfg.critic_batches * len(sets)),
                 float(torch.cat([Y for _, _, Y in sets]).mean()))
 
     # ---- scoring in the replica -------------------------------------------------------------------------------
