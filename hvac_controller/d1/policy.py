@@ -14,7 +14,11 @@ no simulator object, no building or weather identity). ``Controller`` holds the 
   per VAV a target temperature inside its band (initially the band centre) and gains on the damper and reheat;
   per AHU a run command, supply temperature, static pressure and recirculation; for the plant the water setpoint,
   pump differential pressure and pump run command. Priors (as K10): AHUs and pump on while the comfort mode is on
-  or due within the hour, supply 288 K, static pressure ~285 Pa, recirculation ~0.67;
+  or due within the hour, supply 288 K, static pressure ~285 Pa, recirculation ~0.67. The run commands stay on in
+  those hours; the network can only add running time outside them (pre-heating, pre-cooling). The pilot
+  (notebook 21, 2026-10-20) let it switch units off in occupied hours too: after ~50 updates the straight-through
+  gradient (always "a little less air saves energy") flipped them off, comfort collapsed and the saturated sigmoid
+  never switched them back;
 - a differentiable PI loop per VAV towards its target (K10's law with tanh in place of the clip): damper
   min + (1 - min) |u|, reheat max(0, -u), each times its learnt gain; Kp and Ki are learnt (initially 0.1, 0.005);
   the integral runs while the comfort mode is on or due, and is zero otherwise;
@@ -237,8 +241,9 @@ class Controller(nn.Module):
         # AHUs and plant: sigmoids into the feasible native ranges.
         lo_n, hi_n = lay["native_lo"], lay["native_hi"]
         s_a, s_p = torch.sigmoid(z_a), torch.sigmoid(z_p)
-        run_a = _hard(torch.sigmoid(z_a[..., 0] + 6.0 * active - 3.0))
-        pump = _hard(torch.sigmoid(z_p[:, 2:3] + 6.0 * active - 3.0))
+        idle = 1.0 - active  # the network's run logits act only outside the comfort hours
+        run_a = _hard(torch.sigmoid(6.0 * active - 3.0 + idle * z_a[..., 0]))
+        pump = _hard(torch.sigmoid(6.0 * active - 3.0 + idle * z_p[:, 2:3]))
         sp = lo_n[:A] + (hi_n[:A] - lo_n[:A]) * s_a[..., 1]
         p = self.p_floor + (hi_n[A:2 * A] - self.p_floor) * s_a[..., 2]
         r = lo_n[2 * A:3 * A] + (self.max_recirc - lo_n[2 * A:3 * A]) * s_a[..., 3]

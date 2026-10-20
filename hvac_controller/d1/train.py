@@ -1,6 +1,7 @@
 """Direction 1, step 6: SHAC through the replica (Xu et al., ICLR 2022), re-implemented from the paper.
 
-Per building (one ``BuildingEnv`` grouping that building's scenarios, ``rows`` batch rows each spread over the
+Per building (one ``BuildingEnv`` grouping that building's scenarios; as many batch rows as ``row_budget`` allows,
+row_budget >= rows x h x VAVs, since the per-VAV activations of the window dominate the memory; rows spread over the
 episode by a burn-in), every iteration:
 
 1. a window of h steps from where the rows stopped: the policy acts, the replica steps, and the actor loss is
@@ -22,13 +23,15 @@ Scored in the replica every ``eval_minutes``: every scenario from its initial st
 plain and seeds >= 1 with observation noise of evaluate.SIGMA, on the training buildings and on held-out ones
 (``--val-caches``). The best policy, by the held-out mean when there are held-out buildings, is kept
 (``d1_policy.pt``, the file policy.KagglePolicy loads). Guards: a non-finite or huge gradient skips the step and halves the learning rate (three
-in a row stop the run), non-finite states restart the rows, the time budget ends the run cleanly, ``last.pt`` is
-written every 15 minutes and ``--resume`` continues from it.
+in a row stop the run), non-finite states restart the rows; a collapse (the moving average of the training reward
+50 % worse than its best) restores the networks and optimisers saved at that best and halves the learning rate; the
+time budget ends the run cleanly, ``last.pt`` is written every 15 minutes and ``--resume`` continues from it.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import pickle
@@ -57,7 +60,7 @@ class Config:
     h: int = 72
     gamma: float = 0.995
     lam: float = 0.95
-    rows: int = 2048  # batch rows per building
+    row_budget: int = 2_870_000  # rows x h x VAVs per window: ~12 GB on a T4 (pilot, 2026-10-20)
     minutes: float = 30.0  # training time budget
     lr_actor: float = 2e-3
     lr_critic: float = 5e-4
@@ -108,7 +111,7 @@ def _plant_key(spec) -> bytes:
 class Building:
     """One building's scenarios as one grouped environment, its layout and its start states."""
 
-    def __init__(self, reps: list[dict], rows: int, device: str):
+    def __init__(self, reps: list[dict], row_budget: int, h: int, device: str):
         spec = reps[0]["spec"]
         for r in reps:
             if _plant_key(r["spec"]) != _plant_key(spec):
@@ -118,6 +121,7 @@ class Building:
         self.labels = [r["info"]["label"] for r in reps]
         self.lay = Layout(reps[0]["meta"]).tensors(device)
         self.ops = Ops("torch", dtype=torch.float32, device=device)
+        rows = row_budget // (h * self.lay["V"])
         self.rows = max(rows - rows % self.S, self.S)
         self.env = self.make_env(self.rows)
         e = self.env
@@ -205,6 +209,7 @@ class Trainer:
         loss = torch.zeros((), device=self.device)
         buf = {"vav": [], "glob": [], "r": [], "done": []}
         reward = torch.zeros((), device=self.device)
+        on = torch.zeros((), device=self.device)
         for t in range(cfg.h):
             cv, cg = self.critic_inputs(b, env, env.obs[sel], I[sel], sel)
             buf["vav"].append(cv.detach())
@@ -214,6 +219,7 @@ class Trainer:
             _, r, done, _ = env.step(a_c, a_d)
             acc = acc + gamma_k * r
             reward = reward + r.detach().mean()
+            on = on + a_d.detach().mean()
             buf["r"].append(r[sel].detach())
             buf["done"].append(done[sel])
             if t < cfg.h - 1:
@@ -233,7 +239,7 @@ class Trainer:
         loss = loss / (B * cfg.h)
         (loss * weight).backward()
         out = {name: torch.stack(v) for name, v in buf.items()}
-        out.update(loss=loss.detach(), reward=reward / cfg.h,
+        out.update(loss=loss.detach(), reward=reward / cfg.h, on=on / cfg.h,
                    end={"state": {n: v.detach() for n, v in env.state.items()}, "obs": env.obs.detach(),
                         "I": I.detach(), "k": env.k})
         return out
@@ -248,7 +254,8 @@ class Trainer:
             b.start[n].copy_(end[n])
 
     def _weight(self, b: Building) -> float:
-        return b.rows / sum(x.rows for x in self.buildings)
+        """Each scenario counts equally, as in the score (each loss is already a mean over its rows)."""
+        return b.S / sum(x.S for x in self.buildings)
 
     def capture(self, b: Building) -> dict:
         """Captures b's window as a CUDA graph if it reproduces eager; returns the comparison."""
@@ -271,6 +278,7 @@ class Trainer:
                 for _ in range(2):
                     self.window(b, 1.0)
             torch.cuda.current_stream().wait_stream(side)
+            torch.cuda.empty_cache()  # the graph's private pool cannot reuse blocks cached by the warm-up
             graph = torch.cuda.CUDAGraph()
             self.opt_a.zero_grad(set_to_none=False)
             with torch.cuda.graph(graph):
@@ -400,7 +408,7 @@ class Trainer:
             log(f"[train] CUDA graph: {report['setup']['graph']}")
         budget = cfg.minutes * 60.0
         t_start, t_ckpt, t_eval = time.time(), time.time(), time.time()
-        bad = 0
+        bad, ema, best_ema, snap, cooldown, rollbacks = 0, None, -math.inf, None, 0, 0
         with open(out / "train_log.jsonl", "a") as flog:
             while True:
                 elapsed = time.time() - t_start + self.minutes_done * 60.0
@@ -409,12 +417,13 @@ class Trainer:
                 frac = elapsed / budget
                 t_it = time.time()
                 self.opt_a.zero_grad(set_to_none=False)
-                data, losses, rewards = [], [], []
+                data, losses, rewards, ons = [], [], [], []
                 for b in self.buildings:
                     d = self.run_window(b)
                     data.append(d)
                     losses.append(float(d["loss"]))
                     rewards.append(float(d["reward"]))
+                    ons.append(float(d["on"]))
                 norm, stepped = self.actor_step(frac, losses)
                 if not stepped:
                     bad += 1
@@ -432,10 +441,25 @@ class Trainer:
                     self._advance_start(b, d["end"])
                 c_loss, g_mean = self.critic_step(data, frac)
                 self.iteration += 1
+                # Collapse guard on the moving average of the training reward (rewards are negative).
+                r_mean = float(np.mean(rewards))
+                ema = r_mean if ema is None else 0.9 * ema + 0.1 * r_mean
+                if cooldown > 0:
+                    cooldown -= 1
+                elif ema > best_ema:
+                    best_ema, snap = ema, self._snapshot()
+                elif self.iteration > 20 and ema < 1.5 * best_ema and snap is not None:
+                    self._restore(snap)
+                    self.lr_scale *= 0.5
+                    rollbacks += 1
+                    log(f"[train] it {self.iteration}: reward average {ema:.5f} vs best {best_ema:.5f}: collapse, "
+                        f"networks restored to that best, lr scale {self.lr_scale}")
+                    ema, cooldown = None, 10
                 row = {"it": self.iteration, "min": elapsed / 60.0, "loss": float(np.mean(losses)),
                        "reward": float(np.mean(rewards)), "grad_norm": norm, "critic_loss": c_loss,
                        "td_target_mean": g_mean,
-                       "kp": float(torch.exp(self.ctrl.log_kp)), "ki": float(torch.exp(self.ctrl.log_ki)),
+                       "kp": float(torch.exp(self.ctrl.log_kp.detach())), "ki": float(torch.exp(self.ctrl.log_ki.detach())),
+                       "on_frac": float(np.mean(ons)), "rollbacks": rollbacks,
                        "s": time.time() - t_it,
                        "env_steps_per_s": sum(b.rows for b in self.buildings) * cfg.h / (time.time() - t_it),
                        "mem_gb": torch.cuda.max_memory_allocated() / 2 ** 30 if self.device.startswith("cuda") else 0}
@@ -443,7 +467,7 @@ class Trainer:
                 flog.flush()
                 if self.iteration % 20 == 1:
                     log(f"[train] it {row['it']} {row['min']:.1f} min: reward {row['reward']:.5f} loss {row['loss']:.5f} "
-                        f"grad {norm:.3g} critic {c_loss:.3g} G {g_mean:.3f} Kp {row['kp']:.3f} "
+                        f"grad {norm:.3g} critic {c_loss:.3g} G {g_mean:.3f} on {row['on_frac']:.2f} Kp {row['kp']:.3f} "
                         f"Ki {row['ki']:.4f} | {row['s']:.2f} s/it {row['env_steps_per_s']:,.0f} env-steps/s "
                         f"{row['mem_gb']:.1f} GB")
                 if time.time() - t_eval >= cfg.eval_minutes * 60.0:
@@ -455,8 +479,20 @@ class Trainer:
         elapsed = time.time() - t_start + self.minutes_done * 60.0
         self._eval_and_keep(report, elapsed)
         self.save(out / "last.pt", elapsed / 60.0)
-        report.update(iterations=self.iteration, minutes=elapsed / 60.0, best=self.best)
+        report.update(iterations=self.iteration, minutes=elapsed / 60.0, best=self.best, rollbacks=rollbacks)
         return report
+
+    def _snapshot(self) -> dict:
+        return copy.deepcopy({"ctrl": self.ctrl.state_dict(), "critic": self.critic.state_dict(),
+                              "target": self.target.state_dict(), "opt_a": self.opt_a.state_dict(),
+                              "opt_c": self.opt_c.state_dict()})
+
+    def _restore(self, snap: dict) -> None:
+        self.ctrl.load_state_dict(snap["ctrl"])  # in place: a captured graph keeps reading the same tensors
+        self.critic.load_state_dict(snap["critic"])
+        self.target.load_state_dict(snap["target"])
+        self.opt_a.load_state_dict(snap["opt_a"])
+        self.opt_c.load_state_dict(snap["opt_c"])
 
     def _restart_rows(self, b: Building) -> None:
         b.graph = None  # the graph's start buffers may be poisoned: back to eager from fresh start states
@@ -511,14 +547,14 @@ def parity_check(ctrl: Controller, rep: dict, device: str, n_steps: int, tmp: Pa
     return {"steps": n_steps, "cont_max_abs": worst_c, "disc_mismatch": worst_d, "ok": worst_c < 1e-4 and worst_d == 0}
 
 
-def load_buildings(caches: list[Path], rows: int, device: str) -> list[Building]:
+def load_buildings(caches: list[Path], row_budget: int, h: int, device: str) -> list[Building]:
     """Caches (named <building>__<weather>.pkl by notebook 20) grouped by building, one Building each."""
     groups: dict[str, list[dict]] = {}
     for p in sorted(caches):
         rep = load_replica(p)
         rep["info"]["label"] = p.stem
         groups.setdefault(p.stem.split("__")[0], []).append(rep)
-    return [Building(reps, rows, device) for _, reps in sorted(groups.items())]
+    return [Building(reps, row_budget, h, device) for _, reps in sorted(groups.items())]
 
 
 def main() -> None:
@@ -546,8 +582,8 @@ def main() -> None:
     t0 = time.time()
     for attempt in range(4):  # out of memory at start-up: halve the rows
         try:
-            buildings = load_buildings(caches, cfg.rows, device)
-            val = load_buildings(val_caches, 1, device)
+            buildings = load_buildings(caches, cfg.row_budget, cfg.h, device)
+            val = load_buildings(val_caches, 0, cfg.h, device)
             trainer = Trainer(cfg, buildings, val, device, out, log)
             if a.resume:
                 trainer.load(a.resume)
@@ -562,9 +598,9 @@ def main() -> None:
             report.update(trainer.train())
             break
         except torch.cuda.OutOfMemoryError:
-            cfg.rows //= 2
-            report.setdefault("oom_halvings", []).append(cfg.rows)
-            log(f"[train] out of memory: rows -> {cfg.rows}")
+            cfg.row_budget //= 2
+            report.setdefault("oom_halvings", []).append(cfg.row_budget)
+            log(f"[train] out of memory: row budget -> {cfg.row_budget}")
             buildings = val = trainer = None
             torch.cuda.empty_cache()
     report["seconds"] = time.time() - t0

@@ -90,7 +90,8 @@ notebooks/                  # Kaggle notebooks only; each clones this repo and c
   00_probe.ipynb            # runs probes.py
   12_d1_env_check.ipynb     # runs d1/env_check.py: MODE debug (3 scenarios x 2 days) or gate (30 x 30 days, sharded)
   20_d1_cache.ipynb         # caches + K10 null group (original and replica): MODE pilot (atlanta_2) or all (sharded)
-  21_d1_train.ipynb         # GPU T4 x2: smoke checks, training runs, best runs scored in the original vs K10
+  21_d1_train.ipynb         # GPU T4 x2: smoke checks, held_out + all training runs, scored in the original vs K10, packaged
+  22_d1_submit.ipynb        # submission, Internet off: the policy dataset (notebook 21's data.zip: weights + d1_policy.py) in the inference server
 ```
 
 ## Install
