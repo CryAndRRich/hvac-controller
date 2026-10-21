@@ -92,7 +92,7 @@ notebooks/                  # Kaggle notebooks only; each clones this repo and c
   12_d1_env_check.ipynb     # runs d1/env_check.py: MODE debug (3 scenarios x 2 days) or gate (30 x 30 days, sharded)
   20_d1_cache.ipynb         # caches + reference runs: MODE pilot / all (shipped, K10 null group) or gen (V2 generated scenarios, sharded)
   21_d1_train.ipynb         # GPU T4 x2: smoke checks, main + no_memory runs, winner scored in the original vs K10 and V1, packaged
-  22_d1_submit.ipynb        # submission, Internet off: the policy dataset (notebook 21's data.zip: weights + d1_policy.py) in the inference server
+  22_d1_submit.ipynb        # submission, Internet off: the policy dataset (notebook 21's d1_submission_v2.zip: weights + d1_policy.py) in the inference server
 ```
 
 ## Install
