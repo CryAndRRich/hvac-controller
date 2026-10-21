@@ -10,8 +10,9 @@ Every run is one job, written to its own JSON file as soon as it finishes, so a 
 restarted and skips what is done. Jobs run in fresh processes (the simulator keeps gin and occupancy state).
 
 Policies by name: ``k10`` (the baseline, hvac_controller.baseline_k10), ``trained:<path>`` (policy.KagglePolicy with
-the weights at path; in job file names the path becomes its parent folder's name) or any key of the starter kit's
-POLICY_MAP.
+the weights at path; in job file names the path becomes its parent folder's name), ``pkg:<dir>`` (a submission
+package: the KagglePolicy of the d1_policy.py in dir with its d1_policy.pt, so an earlier version runs with its own
+code; named after dir) or any key of the starter kit's POLICY_MAP.
 """
 
 from __future__ import annotations
@@ -69,6 +70,14 @@ def make_policy(name: str, meta: dict, action_spec, spec, seed: int):
         from hvac_controller.d1.policy import KagglePolicy
 
         policy = KagglePolicy(meta, action_spec, weights=Path(name.split(":", 1)[1]))
+    elif name.startswith("pkg:"):
+        import importlib.util
+
+        d = Path(name.split(":", 1)[1])
+        spec_file = importlib.util.spec_from_file_location(f"pkg_{d.name}", d / "d1_policy.py")
+        module = importlib.util.module_from_spec(spec_file)
+        spec_file.loader.exec_module(module)
+        policy = module.KagglePolicy(meta, action_spec, weights=d / "d1_policy.pt")
     else:
         policy = evaluate.initialize_policy(evaluate.POLICY_MAP[name], meta, action_spec)
     return policy if seed == 0 else NoisyPolicy(policy, obs_noise_mask(spec), SIGMA, seed)
@@ -141,7 +150,9 @@ def run_replica(cache: str, policy: str, seed: int, n_steps: int) -> dict:
 
 
 def policy_tag(name: str) -> str:
-    return Path(name.split(":", 1)[1]).parent.name if name.startswith("trained:") else name
+    if name.startswith("trained:"):
+        return Path(name.split(":", 1)[1]).parent.name
+    return Path(name.split(":", 1)[1]).name if name.startswith("pkg:") else name
 
 
 def job_name(job: dict) -> str:

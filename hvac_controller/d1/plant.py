@@ -1,4 +1,4 @@
-"""Equipment, reward and observation of one building as pure batched functions, on NumPy or PyTorch (ops.Ops).
+"""Equipment, reward and observation of a building as pure batched functions, on NumPy or PyTorch (ops.Ops).
 
 Mirrors what one env.step of the organisers' simulator computes around its thermal solve
 (simulator_flexible_floor_plan.execute_step_sim, the device models, SetpointEnergyCarbonRegretFunction and
@@ -22,11 +22,20 @@ Facts the order of operations encodes (read from the organisers' code, checked a
 ``exact=True`` keeps the organisers' branches. ``exact=False`` relaxes the two discrete switches (AHU and hot-water
 run commands, given in [0, 1]) to products, for gradients. ``emulate_f32`` rounds wherever the organisers store a
 value in a protobuf float: native actions, the reward's inputs and output, and observations.
+
+Several buildings in one batch (``specs`` of different buildings, one per scenario, rows grouped by scenario): every
+device dimension is padded to the largest building's, and each row's constants, index maps and action and
+observation layouts are its scenario's. A row's observation holds its building's fields first, in order, then zeros;
+its action is read from its building's columns. Padding is inert: a padded VAV has no flow capacity and no reheat
+and belongs to no AHU (it reads its pressure and supply from AHU 0, a real one), a padded AHU serves no VAV, a
+padded zone has no floor area and no occupants. With one building nothing is padded and every operation is the
+one-building one.
 """
 
 from __future__ import annotations
 
 import math
+import pickle
 
 import numpy as np
 
@@ -34,45 +43,114 @@ from hvac_controller.d1.ops import Ops
 from hvac_controller.d1.spec import SOURCE_KIND, SOURCES, BuildingSpec
 
 TINY = 1e-30  # inside square roots, so their gradient stays finite at zero; never changes a forward value
+# What differs between buildings (per scenario in a padded batch); everything else must be equal.
+BUILDING_FIELDS = ("zone_names", "vav_ids", "ahu_ids", "zone_cells", "vav_zone_share", "vav_ahu", "ahu_weight", "ahu",
+                   "vav", "cont", "disc", "obs", "reset_raw", "tank0", "ret0", "field_names")
+SHARED_FIELDS = ("dt", "hws", "sim", "phys", "exo_fields", "occupancy_norm")
+SHARED_REWARD = ("w_prod", "w_cost", "w_carbon", "max_pph", "min_pph", "dev_ref")  # max_elec and max_gas scale with
+# the AHU count, but only through the exogenous max_cost and max_carbon
+# Padding values of the per-device constants: inert, and no division by zero.
+PAD_AHU = {"max_flow": 1.0, "max_recirc": 0.7, "min_pressure": 0.0, "fan_eff": 1.0, "cop": 1.0}
+PAD_VAV = {"max_flow": 0.0, "min_damper": 0.1, "max_discharge": 400.0, "design_pressure": 1.0, "reheat_ff": 0.0}
+
+
+def building_key(spec: BuildingSpec) -> bytes:
+    return pickle.dumps([getattr(spec, f) for f in BUILDING_FIELDS + SHARED_FIELDS + ("reward",)])
+
+
+def _pad(v, shape, fill=0.0) -> np.ndarray:
+    v = np.asarray(v, dtype=np.float64)
+    out = np.full(shape, fill, dtype=np.float64)
+    out[tuple(slice(0, n) for n in v.shape)] = v
+    return out
 
 
 class Plant:
-    def __init__(self, spec: BuildingSpec, ops: Ops, exact: bool = True, emulate_f32: bool = True):
+    def __init__(self, spec: BuildingSpec | list[BuildingSpec], ops: Ops, exact: bool = True,
+                 emulate_f32: bool = True, n_rows: int | None = None):
+        """``spec``: one building, or one spec per scenario (rows grouped: row i is scenario i // (n_rows / S))."""
         o = ops
-        self.o, self.spec, self.exact, self.f32 = o, spec, exact, emulate_f32
-        Z, V, A = spec.n_zones, spec.n_vavs, spec.n_ahus
-        self.Z, self.V, self.A = Z, V, A
-        self.share = o.asarray(spec.vav_zone_share)  # (Z, V)
-        self.ahu_w = o.asarray(spec.ahu_weight)  # (A, V)
-        self.vav_ahu = o.index(spec.vav_ahu)
-        onehot = np.zeros((V, A))
-        onehot[np.arange(V), spec.vav_ahu] = 1.0
-        self.onehot = o.asarray(onehot)
-        self.n_vav_per_ahu = o.asarray(onehot.sum(axis=0))
-        ah, vv, p = spec.ahu, spec.vav, spec.phys
-        self.ahu_max, self.max_recirc = o.asarray(ah["max_flow"]), o.asarray(ah["max_recirc"])
-        self.p_min, self.fan_eff, self.cop = o.asarray(ah["min_pressure"]), o.asarray(ah["fan_eff"]), o.asarray(ah["cop"])
-        self.v_max, self.min_damper = o.asarray(vv["max_flow"]), o.asarray(vv["min_damper"])
-        self.max_dis, self.design_p = o.asarray(vv["max_discharge"]), o.asarray(vv["design_pressure"])
-        self.reheat_ff = o.asarray(vv["reheat_ff"])
-        sm = spec.sim
-        self.gain_on = o.asarray(sm["gain_w_per_m2"] * sm["cv_area_m2"] * 1.0 * spec.zone_cells)
-        self.gain_off = o.asarray(sm["gain_w_per_m2"] * sm["cv_area_m2"] * sm["standby_fraction"] * spec.zone_cells)
+        specs = spec if isinstance(spec, list) else [spec]
+        sp0 = specs[0]
+        self.o, self.spec, self.exact, self.f32 = o, sp0, exact, emulate_f32
+        self.grouped = len({building_key(s) for s in specs}) > 1
+        for s in specs:
+            for f in SHARED_FIELDS:
+                if pickle.dumps(getattr(s, f)) != pickle.dumps(getattr(sp0, f)):
+                    raise ValueError(f"{s.label} and {sp0.label} differ in {f}: one batch needs it equal")
+            if any(s.reward[k] != sp0.reward[k] for k in SHARED_REWARD):
+                raise ValueError(f"{s.label} and {sp0.label} differ in the reward's weights or productivity constants")
+        S = len(specs)
+        Z, V, A = (max(getattr(s, n) for s in specs) for n in ("n_zones", "n_vavs", "n_ahus"))
+        self.S, self.Z, self.V, self.A = S, Z, V, A
+        if self.grouped:
+            if n_rows is None or n_rows % S:
+                raise ValueError(f"{n_rows} rows for {S} scenarios")
+            row_s = np.arange(n_rows) // (n_rows // S)
+        n_cont, n_disc = max(len(s.cont) for s in specs), max(len(s.disc) for s in specs)
+        n_obs = max(len(s.obs) for s in specs)
+
+        def per_row(make, shape, fill=0.0):
+            """A constant per device: (shape) for one building, (rows, shape) for several."""
+            if not self.grouped:
+                return o.asarray(make(sp0))
+            return o.asarray(np.stack([_pad(make(s), shape, fill) for s in specs])[row_s])
+
+        def per_scenario(make, shape):
+            """A small matrix: as is for one building, (S, shape) for several (applied by _mm)."""
+            if not self.grouped:
+                return o.asarray(make(sp0))
+            return o.asarray(np.stack([_pad(make(s), shape) for s in specs]))
+
+        def index(make, n):
+            """Columns or devices to take: (n,) for one building, (rows, n) padded with 0 for several."""
+            if not self.grouped:
+                return o.index(make(sp0))
+            return o.index(np.stack([_pad(make(s), (n,)) for s in specs]).astype(np.int64)[row_s])
+
+        def onehot(s, padded_to_ahu0: bool):
+            m = np.zeros((V if self.grouped else s.n_vavs, A if self.grouped else s.n_ahus))
+            m[np.arange(s.n_vavs), s.vav_ahu] = 1.0
+            if padded_to_ahu0:
+                m[s.n_vavs:, 0] = 1.0
+            return m
+
+        self.share_t = per_scenario(lambda s: s.vav_zone_share.T, (V, Z))  # (V, Z): reheat split
+        self.ahu_w_t = per_scenario(lambda s: s.ahu_weight.T, (V, A))  # (V, A): recirculation temperature
+        self.to_ahu = per_scenario(lambda s: onehot(s, False), (V, A))  # VAV -> its AHU, summed
+        self.vav_ahu = o.index(sp0.vav_ahu)
+        self.from_ahu = per_scenario(lambda s: onehot(s, True).T, (A, V)) if self.grouped else None
+        self.n_vav_per_ahu = per_row(lambda s: onehot(s, False).sum(axis=0), (A,))
+        self.n_vav = per_row(lambda s: [float(s.n_vavs)], (1,))
+        ah = {k: per_row(lambda s, k=k: s.ahu[k], (A,), PAD_AHU[k]) for k in PAD_AHU}
+        vv = {k: per_row(lambda s, k=k: s.vav[k], (V,), PAD_VAV[k]) for k in PAD_VAV}
+        self.ahu_max, self.max_recirc, self.p_min = ah["max_flow"], ah["max_recirc"], ah["min_pressure"]
+        self.fan_eff, self.cop = ah["fan_eff"], ah["cop"]
+        self.v_max, self.min_damper = vv["max_flow"], vv["min_damper"]
+        self.max_dis, self.design_p, self.reheat_ff = vv["max_discharge"], vv["design_pressure"], vv["reheat_ff"]
+        sm, p = sp0.sim, sp0.phys
+        self.gain_on = per_row(lambda s: sm["gain_w_per_m2"] * sm["cv_area_m2"] * 1.0 * s.zone_cells, (Z,))
+        self.gain_off = per_row(lambda s: sm["gain_w_per_m2"] * sm["cv_area_m2"] * sm["standby_fraction"] * s.zone_cells,
+                                (Z,))
         self.air_cap = p["air_cp"] * p["air_rho"]  # C_air = (c_p rho) flow, as Vav._reheat_effectiveness
         self.water_cap = p["water_cp"] * p["water_rho"]
         self.boiler_cap = p["boiler_water_cp"] * p["boiler_water_rho"]
         self.head_per_bar = p["gravity"] * p["water_rho"] / p["pa_per_bar"]
-        hw = spec.hws
+        hw = sp0.hws
         r1 = hw["tank_radius"]
         r2 = r1 + hw["ins_t"]
         self.tank_dynamic = hw["cooling_rate"] > 0.0 and hw["heating_rate"] > 0.0 and hw["has_tank"] > 0.0
         self.diss_den = (math.log(r2 / r1) / hw["ins_k"] + 1.0 / hw["conv"] / r2) if hw["has_tank"] else 1.0
-        # Actions.
-        cont, disc = spec.cont, spec.disc
-        self.c_nmin, self.c_nmax = o.asarray([c[2] for c in cont]), o.asarray([c[3] for c in cont])
-        self.c_lo, self.c_hi = o.asarray([c[4] for c in cont]), o.asarray([c[5] for c in cont])
-        self.d_nmin, self.d_nmax = o.asarray([c[2] for c in disc]), o.asarray([c[3] for c in disc])
-        self.d_lo, self.d_hi = o.asarray([c[4] for c in disc]), o.asarray([c[5] for c in disc])
+        # Actions (padded columns: an inert unit range).
+        self.c_nmin = per_row(lambda s: [c[2] for c in s.cont], (n_cont,), -1.0)
+        self.c_nmax = per_row(lambda s: [c[3] for c in s.cont], (n_cont,), 1.0)
+        self.c_lo = per_row(lambda s: [c[4] for c in s.cont], (n_cont,), 0.0)
+        self.c_hi = per_row(lambda s: [c[5] for c in s.cont], (n_cont,), 1.0)
+        self.d_nmin = per_row(lambda s: [c[2] for c in s.disc], (n_disc,), -1.0)
+        self.d_nmax = per_row(lambda s: [c[3] for c in s.disc], (n_disc,), 1.0)
+        self.d_lo = per_row(lambda s: [c[4] for c in s.disc], (n_disc,), 0.0)
+        self.d_hi = per_row(lambda s: [c[5] for c in s.disc], (n_disc,), 1.0)
+        self.n_cont, self.n_disc = n_cont, n_disc
 
         def columns(rows, target, n):
             idx = [-1] * n
@@ -80,12 +158,14 @@ class Plant:
                 if row[0] == target:
                     idx[row[1]] = j
             assert min(idx) >= 0, target
-            return o.index(idx)
+            return idx
 
-        self.i_ahu_sp, self.i_ahu_p, self.i_ahu_r = (columns(cont, t, A) for t in ("ahu_sp", "ahu_p", "ahu_r"))
-        self.i_w_sp, self.i_w_dp = (columns(cont, t, 1) for t in ("w_sp", "w_dp"))
-        self.i_damper, self.i_valve = (columns(cont, t, V) for t in ("damper", "valve"))
-        self.i_ahu_on, self.i_w_on = columns(disc, "ahu_on", A), columns(disc, "w_on", 1)
+        self.i_ahu_sp, self.i_ahu_p, self.i_ahu_r = (index(lambda s, t=t: columns(s.cont, t, s.n_ahus), A)
+                                                     for t in ("ahu_sp", "ahu_p", "ahu_r"))
+        self.i_w_sp, self.i_w_dp = (index(lambda s, t=t: columns(s.cont, t, 1), 1) for t in ("w_sp", "w_dp"))
+        self.i_damper, self.i_valve = (index(lambda s, t=t: columns(s.cont, t, s.n_vavs), V) for t in ("damper", "valve"))
+        self.i_ahu_on = index(lambda s: columns(s.disc, "ahu_on", s.n_ahus), A)
+        self.i_w_on = index(lambda s: columns(s.disc, "w_on", 1), 1)
         # Observations: one gather into [sources | exogenous] followed by the per-field normalisation.
         width = {"vav": V, "ahu": A, "one": 1}
         offset, start = {}, 0
@@ -93,30 +173,46 @@ class Plant:
             offset[s] = start
             start += width[SOURCE_KIND[s]]
         self.n_src = start
-        gather, mean, std, plain = [], [], [], []
-        for kind, name, i, m, sd in spec.obs:
-            if kind == "src":
-                gather.append(offset[name] + i)
-            else:
-                gather.append(self.n_src + i)
-            plain.append(kind == "exo")
-            mean.append(m)
-            std.append(sd)
-        self.obs_gather = o.index(gather)
-        self.obs_mean, self.obs_std = o.asarray(mean), o.asarray(std)
-        self.obs_std_safe = o.asarray([s if s > 0.0 else 1.0 for s in std])
-        self.obs_plain = o.asarray(plain) > 0.5
-        self.obs_zero = o.asarray([(not p) and s <= 0.0 for p, s in zip(plain, std)]) > 0.5
-        self.n_obs = len(gather)
 
-    def max_air_conductance(self) -> np.ndarray:
+        def obs_layout(s):
+            gather, mean, std, plain = [], [], [], []
+            for kind, name, i, m, sd in s.obs:
+                gather.append(offset[name] + i if kind == "src" else self.n_src + i)
+                plain.append(float(kind == "exo"))
+                mean.append(m)
+                std.append(sd)
+            zero = [float((not p) and sd <= 0.0) for p, sd in zip(plain, std)]
+            return gather, mean, std, plain, zero
+
+        layouts = [obs_layout(s) for s in specs]
+        if not self.grouped:
+            gather, mean, std, plain, zero = layouts[0]
+            self.obs_gather = o.index(gather)
+            self.obs_mean, self.obs_std = o.asarray(mean), o.asarray(std)
+            self.obs_std_safe = o.asarray([s if s > 0.0 else 1.0 for s in std])
+            self.obs_plain, self.obs_zero = o.asarray(plain) > 0.5, o.asarray(zero) > 0.5
+        else:  # padded fields: zero (not plain, "zero variance")
+            stack = (lambda j, fill: np.stack([_pad(lay[j], (n_obs,), fill) for lay in layouts])[row_s])
+            self.obs_gather = o.index(stack(0, 0.0).astype(np.int64))
+            self.obs_mean, std = o.asarray(stack(1, 0.0)), stack(2, 1.0)
+            self.obs_std, self.obs_std_safe = o.asarray(std), o.asarray(np.where(std > 0.0, std, 1.0))
+            self.obs_plain, self.obs_zero = o.asarray(stack(3, 0.0)) > 0.5, o.asarray(stack(4, 1.0)) > 0.5
+        self.n_obs = n_obs
+        self.reset_raw = {k: per_row(lambda s, k=k: s.reset_raw[k], (width[SOURCE_KIND[k]],)) for k in SOURCES}
+        self.max_g = np.stack([_pad(self._max_air_conductance(s), (V,)) for s in specs])  # (S, V)
+
+    @staticmethod
+    def _max_air_conductance(sp: BuildingSpec) -> np.ndarray:
         """Upper bound of g = flow * rho * c_p per VAV over every valid action: full damper, the highest static
         pressure the action range allows (1 % over it: the organisers reject actions beyond a 1e-5 tolerance), and
         no AHU capacity cap."""
-        sp = self.spec
         p_max = 1.01 * max(max(row[5] for row in sp.cont if row[0] == "ahu_p"), float(np.max(sp.ahu["min_pressure"])))
         flow = sp.vav["max_flow"] * np.sqrt(p_max / sp.vav["design_pressure"])
         return sp.phys["air_rho"] * sp.phys["air_cp"] * flow
+
+    def max_air_conductance(self) -> np.ndarray:
+        """(V,) for one building, (S, V) per scenario when padded."""
+        return self.max_g if self.grouped else self.max_g[0]
 
     # ------------------------------------------------------------------------------------------------- helpers
     def _r32(self, x):
@@ -128,18 +224,32 @@ class Plant:
             return self.o.where(on > 0.5, a, b)
         return on * a + (1.0 - on) * b
 
+    def _mm(self, x, m):
+        """x (B, n) times a small matrix: (n, k), or per scenario (S, n, k) over the grouped rows."""
+        if not self.grouped:
+            return x @ m
+        return (x.reshape(self.S, -1, x.shape[1]) @ m).reshape(x.shape[0], -1)
+
+    def _take(self, x, idx):
+        """Columns of x: idx (n,) for one building, (B, n) per row."""
+        return x[:, idx] if not self.grouped else self.o.take(x, idx)
+
+    def _at_vav(self, x):
+        """A per-AHU quantity at each VAV's AHU."""
+        return x[:, self.vav_ahu] if not self.grouped else self._mm(x, self.from_ahu)
+
     # -------------------------------------------------------------------------------------------------- decode
     def decode(self, a_cont, a_disc) -> dict:
         """Hybrid action (continuous in [-1, 1], discrete in {0, 1}; [0, 1] when relaxed) -> device settings."""
-        o = self
+        o, t = self, self._take
         nat_c = (a_cont - o.c_nmin) / (o.c_nmax - o.c_nmin) * (o.c_hi - o.c_lo) + o.c_lo
         nat_d = ((2.0 * a_disc - 1.0) - o.d_nmin) / (o.d_nmax - o.d_nmin) * (o.d_hi - o.d_lo) + o.d_lo
         nat_c, nat_d = self._r32(nat_c), self._r32(nat_d)
         return self.settings(
-            ahu_on=nat_d[:, o.i_ahu_on], w_on=nat_d[:, o.i_w_on][:, 0],
-            ahu_sp=nat_c[:, o.i_ahu_sp], ahu_p=nat_c[:, o.i_ahu_p], ahu_r=nat_c[:, o.i_ahu_r],
-            w_sp=nat_c[:, o.i_w_sp][:, 0], w_dp=nat_c[:, o.i_w_dp][:, 0],
-            damper=nat_c[:, o.i_damper], valve=nat_c[:, o.i_valve])
+            ahu_on=t(nat_d, o.i_ahu_on), w_on=t(nat_d, o.i_w_on)[:, 0],
+            ahu_sp=t(nat_c, o.i_ahu_sp), ahu_p=t(nat_c, o.i_ahu_p), ahu_r=t(nat_c, o.i_ahu_r),
+            w_sp=t(nat_c, o.i_w_sp)[:, 0], w_dp=t(nat_c, o.i_w_dp)[:, 0],
+            damper=t(nat_c, o.i_damper), valve=t(nat_c, o.i_valve))
 
     def settings(self, ahu_on, w_on, ahu_sp, ahu_p, ahu_r, w_sp, w_dp, damper, valve) -> dict:
         """Native commands -> what the devices hold (set_action and the property setters)."""
@@ -168,16 +278,16 @@ class Plant:
         """Everything before the thermal solve. y: (B, V + Z) sensed and zone temperatures at t."""
         x, V = self.o, self.V
         sens = y[:, :V]
-        recirc = sens @ self.ahu_w.T
+        recirc = self._mm(sens, self.ahu_w_t)
         _, supply = self._supply(dev, recirc, t_amb)
         on = dev["ahu_on"]
         p_eff = self._switch(on, x.maximum(dev["ahu_p_cmd"], self.p_min), 0.0)
-        p_v = p_eff[:, self.vav_ahu]
+        p_v = self._at_vav(p_eff)
         demand = x.maximum(dev["damper"] * self.v_max * x.sqrt(x.maximum(p_v / self.design_p, TINY)), 1e-5)
-        demanded = demand @ self.onehot
-        ratio = x.minimum(1.0, self.ahu_max / demanded)
-        flow = demand * ratio[:, self.vav_ahu]
-        ahu_raw = x.minimum(flow @ self.onehot, self.ahu_max)  # AirHandler._air_flow_rate, capped as it accumulates
+        demanded = self._mm(demand, self.to_ahu)
+        ratio = x.minimum(1.0, self.ahu_max / x.where(demanded > 0.0, demanded, 1.0))  # 0 only on a padded AHU
+        flow = demand * self._at_vav(ratio)
+        ahu_raw = x.minimum(self._mm(flow, self.to_ahu), self.ahu_max)  # AirHandler._air_flow_rate, capped as it accumulates
         ahu_flow = self._switch(on, ahu_raw, 0.0)  # the gated air_flow_rate the fans and sensors see
         ff = dev["valve"] * self.reheat_ff
         ff_sum = x.sum(ff, 1)
@@ -190,7 +300,7 @@ class Plant:
         c_air = self.air_cap * flow
         c_water = self.water_cap * water_share
         eff0 = x.minimum(1.0, c_water / c_air)
-        ts = supply[:, self.vav_ahu]
+        ts = self._at_vav(supply)
         t_w = tank[:, None]
         gap = t_w - ts
         headroom = self.max_dis - ts
@@ -198,7 +308,7 @@ class Plant:
         eff = x.where(gap <= 0.0, eff0, x.where(headroom <= 0.0, 0.0, capped))
         reheat = eff * c_air * (t_w - ts)
         gains = x.where(comfort[:, None] > 0.5, self.gain_on, self.gain_off)
-        q_zone = reheat @ self.share.T + gains + occ_step * self.spec.sim["occupant_w"]
+        q_zone = self._mm(reheat, self.share_t) + gains + occ_step * self.spec.sim["occupant_w"]
         g = flow * self.spec.phys["air_rho"] * self.spec.phys["air_cp"]
         return {"sens": sens, "p_eff": p_eff, "ratio": ratio, "flow": flow, "ahu_raw": ahu_raw, "ahu_flow": ahu_flow,
                 "ff_sum": ff_sum, "dp": dp, "q_water": q_water, "reheat": reheat, "q_zone": q_zone, "g": g, "ts": ts,
@@ -227,7 +337,7 @@ class Plant:
         else:
             tank_new, d_tank = sp, 0.0 * sp
         # Billed energy, from the state after the step.
-        recirc_n = y_new[:, :V] @ self.ahu_w.T
+        recirc_n = self._mm(y_new[:, :V], self.ahu_w_t)
         mixed_n, supply_n = self._supply(dev, recirc_n, t_amb_next)
         cool = x.sum(aux["ahu_raw"] * self.spec.phys["air_rho"] * self.spec.phys["air_cp"] * (supply_n - mixed_n)
                      / self.cop, 1)
@@ -268,7 +378,7 @@ class Plant:
             "vav_cool_sp": win_now[:, 1:2] + 0.0 * aux["sens"], "ahu_count": self.n_vav_per_ahu + 0.0 * p_eff,
             "ahu_p": p_eff, "ahu_flow": ahu_flow, "ahu_sp": dev["ahu_sp"], "ahu_on": dev["ahu_on"],
             "ahu_speed": aux["ahu_raw"] / self.ahu_max, "ahu_oa_flow": (1.0 - r) * aux["ahu_raw"], "ahu_r": r,
-            "w_sp": sp[:, None], "tank": tank_new[:, None], "w_count": float(V) + 0.0 * sp[:, None],
+            "w_sp": sp[:, None], "tank": tank_new[:, None], "w_count": self.n_vav + 0.0 * sp[:, None],
             "w_on": dev["w_on"][:, None], "w_dp": aux["dp"][:, None],
         }
         return {"ret": ret_new, "tank": tank_new, "d_tank": d_tank, "cool": cool, "blower": blower, "pump": pump,
@@ -278,7 +388,7 @@ class Plant:
     def observe(self, src: dict, obs_exo):
         """Raw sources (B, width) and exogenous columns (B, n_exo) -> the observation vector the policy sees."""
         x = self.o
-        raw = x.concatenate([src[s] for s in SOURCES] + [obs_exo], 1)[:, self.obs_gather]
+        raw = self._take(x.concatenate([src[s] for s in SOURCES] + [obs_exo], 1), self.obs_gather)
         if self.f32:
             raw = x.round_f32(raw)
         norm = (raw - self.obs_mean) / self.obs_std_safe
@@ -287,5 +397,8 @@ class Plant:
 
     def reset_obs(self, batch: int, obs_exo0):
         x = self.o
-        src = {s: x.asarray(np.repeat(self.spec.reset_raw[s][None, :], batch, axis=0)) for s in SOURCES}
+        if self.grouped:
+            src = {s: self.reset_raw[s] + 0.0 for s in SOURCES}
+        else:
+            src = {s: x.asarray(np.repeat(self.spec.reset_raw[s][None, :], batch, axis=0)) for s in SOURCES}
         return self.observe(src, obs_exo0)

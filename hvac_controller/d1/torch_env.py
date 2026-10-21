@@ -6,12 +6,12 @@ windows). The action is the competition's hybrid action: continuous values in [-
 {0, 1} (any value in [0, 1] when ``exact=False``; with 0 / 1 that relaxed plant computes exactly what the exact one
 does). Continuous values must stay in [-1, 1], as the organisers require: the air solve's sweep count relies on it.
 
-One environment holds one building and S scenarios of it (same plant; each scenario its own ROM, for its materials
-and convection coefficient, and its own exogenous series). Its batch of B = S * b rows is grouped: row i runs
-scenario i // b. Every row has its own step index ``k``, so rows can sit at different times of their episode; a row
-whose episode ends is put back to the scenario's initial state by ``reset_done``. Nothing in a step reads a tensor
-value on the host, so a window can be captured as a CUDA graph. With the NumPy backend and S = 1 it is the validation
-replica that env_check compares with the organisers' simulator.
+One environment holds S scenarios, each with its own ROM (for its materials and convection coefficient) and its own
+exogenous series, of one building or of several (then every device dimension is padded to the largest, plant.py).
+Its batch of B = S * b rows is grouped: row i runs scenario i // b. Every row has its own step index ``k``, so rows
+can sit at different times of their episode; a row whose episode ends is put back to the scenario's initial state by
+``reset_done``. Nothing in a step reads a tensor value on the host. With the NumPy backend and S = 1 it is the
+validation replica that env_check compares with the organisers' simulator.
 
 ``replica_from_env`` builds the three inputs (spec, ROM, exogenous series) from a freshly loaded environment.
 """
@@ -67,8 +67,9 @@ class ThermalRom:
     """
 
     def __init__(self, roms: list[LinearRom], ops: Ops, g_max: np.ndarray):
+        """g_max: (V,) for one building, (S, V) per scenario."""
         o = ops
-        Z, V = roms[0].n_zones, roms[0].n_vavs
+        Z, V = max(rom.n_zones for rom in roms), max(rom.n_vavs for rom in roms)
         S, r = len(roms), max(rom.order for rom in roms)
         self.o, self.S, self.V = o, S, V
 
@@ -79,17 +80,30 @@ class ThermalRom:
                 out[(s,) + tuple(slice(0, n) for n in v.shape)] = v
             return out
 
+        def outputs(v, rom):
+            """Rows [V_s | Z_s] (sensed per VAV, mean per zone) placed as [V | Z]."""
+            out = np.zeros((V + Z,) + v.shape[1:])
+            out[:rom.n_vavs] = v[:rom.n_vavs]
+            out[V:V + rom.n_zones] = v[rom.n_vavs:]
+            return out
+
         self.a = o.asarray(stack(lambda m: m.a, (r,))[:, None, :])  # (S, 1, r)
-        self.b_q_t = o.asarray(stack(lambda m: m.b[:, :Z].T, (Z, r)))  # (S, Z, r)
-        self.b_p_t = o.asarray(stack(lambda m: m.b[:, Z:Z + V].T, (V, r)))
-        self.b_a = o.asarray(stack(lambda m: m.b[:, Z + V], (r,))[:, None, :])
-        self.c_t = o.asarray(stack(lambda m: m.c.T, (r, V + Z)))  # (S, r, V + Z)
-        self.n_p_t = o.asarray(np.stack([rom._np.T for rom in roms]))  # (S, V, V + Z): output response to air power
-        m = np.stack([np.asarray(rom._m, dtype=np.float64) for rom in roms])  # (S, V, V): reduced Q^T A^-1 P
+        self.b_q_t = o.asarray(stack(lambda m: m.b[:, :m.n_zones].T, (Z, r)))  # (S, Z, r)
+        self.b_p_t = o.asarray(stack(lambda m: m.b[:, m.n_zones:m.n_zones + m.n_vavs].T, (V, r)))
+        self.b_a = o.asarray(stack(lambda m: m.b[:, m.n_zones + m.n_vavs], (r,))[:, None, :])
+        self.c_t = o.asarray(stack(lambda m: outputs(m.c, m).T, (r, V + Z)))  # (S, r, V + Z)
+        if all((rom.n_zones, rom.n_vavs) == (Z, V) for rom in roms):  # as before padding existed: same memory layout,
+            n_p = np.stack([rom._np.T for rom in roms])  # so the same BLAS path and bit-identical results
+        else:
+            n_p = stack(lambda m: outputs(m._np, m).T, (V, V + Z))
+        self.n_p_t = o.asarray(n_p)  # (S, V, V + Z): output response to air power
+        m = stack(lambda rom: np.asarray(rom._m, dtype=np.float64), (V, V))  # (S, V, V): reduced Q^T A^-1 P
         d = np.diagonal(m, axis1=1, axis2=2).copy()
-        if d.min() <= 0.0:
+        real = np.arange(V)[None, :] < np.array([rom.n_vavs for rom in roms])[:, None]
+        if d[real].min() <= 0.0:
             raise ValueError("the air-side matrix has a non-positive diagonal")
-        off = m - d[:, :, None] * np.eye(V)
+        d[~real] = 1.0  # padded VAVs: no coupling, unit diagonal
+        off = m - np.diagonal(m, axis1=1, axis2=2)[:, :, None] * np.eye(V)
         weight = g_max / (1.0 + g_max * d)
         self.q = float(np.max(weight * np.abs(off).sum(axis=2)))
         tol = 1e-8 if "float32" in str(o.dtype) else 1e-15
@@ -101,7 +115,7 @@ class ThermalRom:
         self.m_diag, self.m_off_t = o.asarray(d[:, None, :]), o.asarray(np.transpose(off, (0, 2, 1)))
         self.t_ref = o.asarray(np.array([rom.t_ref for rom in roms])[:, None, None])  # (S, 1, 1)
         self.x0 = stack(lambda m: m.x0, (r,))  # (S, r), NumPy: rows take theirs in BuildingEnv
-        self.y0 = np.stack([rom.y0 for rom in roms])  # (S, V + Z)
+        self.y0 = np.stack([outputs(rom.y0, rom) for rom in roms])  # (S, V + Z)
 
     def step(self, x, q_zone, t_amb, g, ts):
         """x (B, r), q_zone (B, Z), t_amb (B,), g and ts (B, V) -> x' (B, r) and y' (B, V + Z) in kelvin."""
@@ -129,39 +143,43 @@ class ThermalRom:
 
 
 class BuildingEnv:
-    def __init__(self, spec: BuildingSpec, rom: LinearRom | list[LinearRom], exo: Exogenous | list[Exogenous],
-                 num_envs: int = 1, ops: Ops | None = None, exact: bool = True, emulate_f32: bool = True):
+    def __init__(self, spec: BuildingSpec | list[BuildingSpec], rom: LinearRom | list[LinearRom],
+                 exo: Exogenous | list[Exogenous], num_envs: int = 1, ops: Ops | None = None, exact: bool = True,
+                 emulate_f32: bool = True):
+        """``spec``: the building of every scenario, or one spec per scenario (several buildings: padded)."""
         o = ops or Ops("numpy")
         roms, exos = (rom if isinstance(rom, list) else [rom]), (exo if isinstance(exo, list) else [exo])
         S = len(roms)
-        if len(exos) != S or num_envs % S:
-            raise ValueError(f"{S} ROMs, {len(exos)} exogenous series, {num_envs} rows: need one series per ROM and "
-                             "the same number of rows for each")
+        specs = spec if isinstance(spec, list) else [spec] * S
+        if len(exos) != S or len(specs) != S or num_envs % S:
+            raise ValueError(f"{S} ROMs, {len(exos)} exogenous series, {len(specs)} specs, {num_envs} rows: need one "
+                             "series and spec per ROM and the same number of rows for each")
         for m, e in zip(roms, exos):
             if np.max(np.abs(e.h - m.h)) > 0.0:
                 raise ValueError("a ROM was built for another convection coefficient than its weather gives")
         self.n_steps = exos[0].n_steps
         if any(e.n_steps != self.n_steps for e in exos):
             raise ValueError("exogenous series of different lengths")
-        self.o, self.spec, self.S, self.num_envs = o, spec, S, num_envs
-        self.plant = Plant(spec, o, exact=exact, emulate_f32=emulate_f32)
+        self.o, self.spec, self.S, self.num_envs = o, specs[0], S, num_envs
+        self.plant = Plant(specs, o, exact=exact, emulate_f32=emulate_f32, n_rows=num_envs)
         self.rom = ThermalRom(roms, o, self.plant.max_air_conductance())
-        # Exogenous series as one (S * n, F) table: a step gathers one row per batch row.
+        # Exogenous series as one (S * n, F) table (per-zone columns padded): a step gathers one row per batch row.
         cols, self.exo_cols, start = [], {}, 0
         for name in EXO_STEP:
-            v = np.stack([np.asarray(getattr(e, name), dtype=np.float64).reshape(self.n_steps, -1) for e in exos])
-            width = v.shape[2]
+            per = [np.asarray(getattr(e, name), dtype=np.float64).reshape(self.n_steps, -1) for e in exos]
+            width = max(v.shape[1] for v in per)
+            cols.append(np.stack([np.pad(v, ((0, 0), (0, width - v.shape[1]))) for v in per]))
             self.exo_cols[name] = start if getattr(exos[0], name).ndim == 1 else slice(start, start + width)
-            cols.append(v)
             start += width
         self.exo = o.asarray(np.concatenate(cols, 2).reshape(S * self.n_steps, start))
         self.obs_exo = o.asarray(np.concatenate([e.obs_exo for e in exos]))  # (S * (n + 1), n_exo)
         self.row_s = o.index(np.arange(num_envs) // (num_envs // S))  # scenario of each row
         rows = np.arange(num_envs) // (num_envs // S)
         self.init = {"x": o.asarray(self.rom.x0[rows]), "y": o.asarray(self.rom.y0[rows]),
-                     "tank": o.full((num_envs,), spec.tank0), "ret": o.full((num_envs,), spec.ret0)}
+                     "tank": o.asarray(np.array([sp.tank0 for sp in specs])[rows]),
+                     "ret": o.asarray(np.array([sp.ret0 for sp in specs])[rows])}
         self.num_obs = self.plant.n_obs
-        self.num_actions = (len(spec.cont), len(spec.disc))
+        self.num_actions = (self.plant.n_cont, self.plant.n_disc)
         self.obs0 = self.plant.reset_obs(num_envs, self.obs_exo[self.row_s * (self.n_steps + 1)])
         self.k = None
         self.state = None
