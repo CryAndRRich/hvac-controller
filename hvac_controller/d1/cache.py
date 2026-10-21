@@ -1,14 +1,16 @@
 """One scenario's replica inputs, built once on a CPU and read back by every training and evaluation session.
 
-``save_replica`` loads the scenario, builds the spec, the ROM and the exogenous series (torch_env.replica_from_env;
-the ROM of an 85-zone building takes about 4 minutes) and pickles them together with the policy metadata and the
-action spec the organisers' gateway hands a policy, and writes the build information next to it as JSON.
+``save_replica`` loads the scenario, builds the spec and the exogenous series (torch_env.replica_parts), frees the
+organisers' environment, then builds the ROM (about 4 minutes for an 85-zone building). It pickles them together with
+the policy metadata and the action spec the organisers' gateway hands a policy, and writes the build information next
+to it as JSON.
 ``load_replica`` checks the format version.
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import pickle
 import time
@@ -20,12 +22,20 @@ VERSION = 1
 def save_replica(config: Path, path: Path, n_steps: int = 8640) -> dict:
     from hvac_controller.d1.ops import Ops
     from hvac_controller.d1.plant import Plant
-    from hvac_controller.d1.torch_env import ThermalRom, replica_from_env
+    from hvac_controller.d1.rom import build_rom
+    from hvac_controller.d1.torch_env import ThermalRom, replica_parts
     from hvac_controller.sim import load_env
 
     t0 = time.time()
     env, meta = load_env(Path(config))
-    spec, rom, exo, _, timings = replica_from_env(env, n_steps)
+    action_spec = env.action_spec()
+    spec, core, exo, _, timings = replica_parts(env, n_steps)
+    del env  # the organisers' simulator (grid, its factorisation) is not needed for the ROM: free it first
+    gc.collect()
+    t1 = time.time()
+    rom, rom_info = build_rom(core)
+    del core
+    timings.update(rom_s=time.time() - t1, rom=rom_info)
     thermal = ThermalRom([rom], Ops("numpy", dtype="float32"), Plant(spec, Ops("numpy")).max_air_conductance())
     info = {"config": str(config), "label": spec.label, "n_zones": spec.n_zones, "n_vavs": spec.n_vavs,
             "n_ahus": spec.n_ahus, "n_obs": len(spec.obs), "order": rom.order, "h": rom.h, "jacobi_q": thermal.q,
@@ -33,7 +43,7 @@ def save_replica(config: Path, path: Path, n_steps: int = 8640) -> dict:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as f:
         pickle.dump({"version": VERSION, "spec": spec, "rom": rom, "exo": exo, "meta": meta,
-                     "action_spec": env.action_spec(), "info": info}, f)
+                     "action_spec": action_spec, "info": info}, f)
     path.with_suffix(".json").write_text(json.dumps(info, indent=1, default=str))
     return info
 

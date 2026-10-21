@@ -27,6 +27,7 @@ conductance, so a uniform shift of the field equals shifting the outside and sup
 
 from __future__ import annotations
 
+import tempfile
 import time
 from dataclasses import dataclass
 
@@ -36,6 +37,11 @@ import scipy.sparse.linalg
 
 PERMC = "MMD_AT_PLUS_A"  # the organisers' column ordering
 BLOCK = 64  # right-hand sides per triangular solve
+# Memory of the largest generated buildings (≈ 1.7 M augmented states, ≈ 1,400 basis columns): products with the basis
+# run ROWS rows at a time, so no temporary is as large as the basis, and a basis above BASIS_RAM bytes lives in a
+# temporary file (the page cache keeps what fits). Neither changes the arithmetic.
+ROWS = 1 << 17
+BASIS_RAM = 6 << 30
 # (shift in 1/dt, number of moments); sigma = 1 first so that A^-1 F is never deflated.
 DEFAULT_SHIFTS = ((1.0, 2), (0.0, 1), (1.0 / 12.0, 1), (1.0 / 288.0, 1))
 
@@ -65,15 +71,20 @@ class Core:
         return self.a.shape[0]
 
 
-def solve_block(lu, rhs) -> np.ndarray:
-    """lu.solve on many right-hand sides, BLOCK at a time (dense result)."""
+def solve_block(lu, rhs, out: np.ndarray | None = None) -> np.ndarray:
+    """lu.solve on many right-hand sides, BLOCK at a time, into out (dense; allocated if not given)."""
     n_cols = rhs.shape[1]
-    out = np.empty((rhs.shape[0], n_cols))
+    out = np.empty((rhs.shape[0], n_cols)) if out is None else out
     for start in range(0, n_cols, BLOCK):
         chunk = rhs[:, start:start + BLOCK]
         chunk = chunk.toarray() if scipy.sparse.issparse(chunk) else np.asarray(chunk)
         out[:, start:start + BLOCK] = lu.solve(np.asfortranarray(chunk))
     return out
+
+
+def _row_blocks(n: int):
+    for start in range(0, n, ROWS):
+        yield slice(start, min(start + ROWS, n))
 
 
 # ------------------------------------------------------------------------------------------ the augmented system
@@ -100,10 +111,12 @@ class Augmented:
     def k_mul(self, x: np.ndarray) -> np.ndarray:
         n, mi, g = self.n, self.mi, self.g_m[:, None]
         xt, xm = x[:n], x[n:]
-        out_t = np.asarray(self.k_air @ xt)
+        out = np.empty(x.shape)
+        out[:n] = self.k_air @ xt
         diff = xt[mi] - xm
-        out_t[mi] += g * diff
-        return np.vstack([out_t, -g * diff])
+        out[mi] += g * diff
+        out[n:] = -g * diff
+        return out
 
     def shifted_solver(self, sigma: float):
         """b -> (sigma E + K)^-1 b, with the mass rows eliminated as the organisers do."""
@@ -118,12 +131,14 @@ class Augmented:
         lu = scipy.sparse.linalg.splu(a_s, permc_spec=PERMC)
 
         def solve(b: np.ndarray) -> np.ndarray:
+            z = np.empty(b.shape)
             bt = np.array(b[:n], dtype=np.float64)
             bm = b[n:]
             bt[mi] += (self.g_m / dm)[:, None] * bm
-            zt = solve_block(lu, bt)
-            zm = (bm + self.g_m[:, None] * zt[mi]) / dm[:, None]
-            return np.vstack([zt, zm])
+            solve_block(lu, bt, z[:n])
+            del bt
+            z[n:] = (bm + self.g_m[:, None] * z[:n][mi]) / dm[:, None]
+            return z
 
         return solve, lu
 
@@ -144,32 +159,49 @@ class Basis:
 
     def __init__(self, sqrt_e: np.ndarray, capacity: int):
         self.sqrt_e = sqrt_e
-        self.b = np.empty((len(sqrt_e), capacity))
+        shape = (len(sqrt_e), capacity)
+        if 8 * shape[0] * shape[1] > BASIS_RAM:
+            self._file = tempfile.TemporaryFile()
+            self.b = np.memmap(self._file, dtype=np.float64, mode="w+", shape=shape)
+        else:
+            self.b = np.empty(shape)
         self.r = 0
         self.dropped = 0
 
     def _project_out(self, w):
         if self.r:
             cur = self.b[:, :self.r]
-            w -= cur @ (cur.T @ w)
+            coef = cur.T @ w
+            for rows in _row_blocks(len(w)):
+                w[rows] -= cur[rows] @ coef
         return w
+
+    @staticmethod
+    def _rotate(w, m):
+        """w @ m in place (m is k x k', k' <= k), ROWS rows at a time; returns the first k' columns."""
+        k = m.shape[1]
+        for rows in _row_blocks(len(w)):
+            w[rows, :k] = w[rows] @ m
+        return w[:, :k]
 
     def extend(self, z: np.ndarray, tol: float) -> int:
         """Adds the part of span(z) not yet in the basis; drops directions below tol (relative)."""
         w = z * self.sqrt_e[:, None]
         norms = np.linalg.norm(w, axis=0)
-        w = w[:, norms > 0.0] / norms[norms > 0.0]
+        if not np.all(norms > 0.0):
+            w = w[:, norms > 0.0]
+        w /= norms[norms > 0.0]
         for _ in range(2):
             w = self._project_out(w)
         mu, vec = np.linalg.eigh(w.T @ w)
         keep = mu > tol ** 2
         self.dropped += int(np.sum(~keep)) + int(np.sum(norms == 0.0))
-        w = w @ (vec[:, keep] / np.sqrt(mu[keep]))
+        w = self._rotate(w, vec[:, keep] / np.sqrt(mu[keep]))
         w = self._project_out(w)  # second pass: orthogonal to working precision
         mu, vec = np.linalg.eigh(w.T @ w)
         keep = mu > 1e-2  # unit vectors already; anything that lost most of its length here is rounding noise
         self.dropped += int(np.sum(~keep))
-        w = w @ (vec[:, keep] / np.sqrt(mu[keep]))
+        w = self._rotate(w, vec[:, keep] / np.sqrt(mu[keep]))
         k = w.shape[1]
         self.b[:, self.r:self.r + k] = w
         self.r += k
@@ -199,12 +231,14 @@ def build_basis(aug: Augmented, f: scipy.sparse.csc_matrix, x0: np.ndarray, shif
         t_lu = time.time() - t0
         z = rhs
         for j in range(depth):
-            z = solve(z if j == 0 else aug.e[:, None] * z)
+            if j:
+                z *= aug.e[:, None]  # solve's own output, not rhs
+            z = solve(z)
             added = basis.extend(z, tol)
             info["blocks"].append({"sigma": sigma, "moment": j + 1, "added": added, "r": basis.r,
                                    "lu_s": round(t_lu, 2), "s": round(time.time() - t0, 2)})
             log(f"  basis sigma={sigma:.5f} moment={j + 1}: +{added} -> r={basis.r} ({time.time() - t0:.1f}s)")
-        del lu, solve
+        del lu, solve, z
     info["dropped"] = basis.dropped
     return basis, info
 
@@ -245,7 +279,10 @@ def reduce(aug: Augmented, basis: Basis, f: scipy.sparse.csc_matrix, x0: np.ndar
     b = basis.cols
     k_r = np.empty((r, r))
     for sl, v in basis.v_chunks():
-        k_r[:, sl] = b.T @ (aug.k_mul(v) / aug.sqrt_e[:, None])
+        kv = aug.k_mul(v)
+        del v
+        kv /= aug.sqrt_e[:, None]
+        k_r[:, sl] = b.T @ kv
     f_r = np.asarray((scipy.sparse.diags(1.0 / aug.sqrt_e) @ f).T @ b).T
     x0_r = b.T @ (aug.sqrt_e * x0)
     c = aug.core

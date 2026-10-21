@@ -16,7 +16,7 @@ no simulator object, no building or weather identity). ``Controller`` holds the 
   pump differential pressure and pump run command. Priors (as K10): AHUs and pump on while the comfort mode is on
   or due within the hour, supply 288 K, static pressure ~285 Pa, recirculation ~0.67. The run commands stay on in
   those hours; the network can only add running time outside them (pre-heating, pre-cooling). The pilot
-  (notebook 21, 2026-10-20) let it switch units off in occupied hours too: after ~50 updates the straight-through
+  (2026-10-20) let it switch units off in occupied hours too: after ~50 updates the straight-through
   gradient (always "a little less air saves energy") flipped them off, comfort collapsed and the saturated sigmoid
   never switched them back;
 - a differentiable PI loop per VAV towards its target (K10's law with tanh in place of the clip): damper
@@ -345,10 +345,6 @@ class Controller(nn.Module):
         return a_c, a_d, (I, m_v, m_g)
 
 
-def find_weights(root: Path = Path("/kaggle/input"), name: str = "d1_policy.pt") -> Path:
-    return next(iter(sorted(root.rglob(name))))
-
-
 def save_policy(ctrl: Controller, path: Path) -> None:
     torch.save({"config": ctrl.config, "state_dict": ctrl.state_dict()}, path)
 
@@ -363,8 +359,8 @@ def load_policy(path: Path, device="cpu") -> Controller:
 class KagglePolicy:
     """The gateway's policy: one building, one observation per call, CPU."""
 
-    def __init__(self, building_meta_data, action_spec, weights: Path | None = None):
-        self.ctrl = load_policy(weights or find_weights())
+    def __init__(self, building_meta_data, action_spec, weights: Path):
+        self.ctrl = load_policy(weights)
         self.lay = Layout(building_meta_data).tensors("cpu")
         self.mem = Controller.init_mem(1, self.lay)
 

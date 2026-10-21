@@ -1,10 +1,10 @@
 """The differentiable copy of one building: ROM (step B) + plant (plant.py), batched, on NumPy or PyTorch.
 
 ``BuildingEnv`` follows the batched interface SHAC-style learners use (DiffRL, rewarped): ``num_envs``, ``num_obs``,
-``num_actions``, ``reset``, ``step(action) -> obs, reward, done, extras`` and ``clear_grad`` (cut the graph between
-windows). The action is the competition's hybrid action: continuous values in [-1, 1] and discrete run commands in
-{0, 1} (any value in [0, 1] when ``exact=False``; with 0 / 1 that relaxed plant computes exactly what the exact one
-does). Continuous values must stay in [-1, 1], as the organisers require: the air solve's sweep count relies on it.
+``num_actions``, ``reset`` and ``step(action) -> obs, reward, done, extras``. The action is the competition's hybrid
+action: continuous values in [-1, 1] and discrete run commands in {0, 1} (any value in [0, 1] when ``exact=False``;
+with 0 / 1 that relaxed plant computes exactly what the exact one does). Continuous values must stay in [-1, 1], as
+the organisers require: the air solve's sweep count relies on it.
 
 One environment holds S scenarios, each with its own ROM (for its materials and convection coefficient) and its own
 exogenous series, of one building or of several (then every device dimension is padded to the largest, plant.py).
@@ -13,7 +13,8 @@ can sit at different times of their episode; a row whose episode ends is put bac
 ``reset_done``. Nothing in a step reads a tensor value on the host. With the NumPy backend and S = 1 it is the
 validation replica that env_check compares with the organisers' simulator.
 
-``replica_from_env`` builds the three inputs (spec, ROM, exogenous series) from a freshly loaded environment.
+``replica_from_env`` builds the three inputs (spec, ROM, exogenous series) from a freshly loaded environment;
+``replica_parts`` builds all but the ROM, so that the environment can be freed before the ROM build (cache.py).
 """
 
 from __future__ import annotations
@@ -27,29 +28,36 @@ import numpy as np
 from hvac_controller.d1.core import core_from_env
 from hvac_controller.d1.ops import Ops
 from hvac_controller.d1.plant import Plant
-from hvac_controller.d1.rom import LinearRom, build_rom
+from hvac_controller.d1.rom import Core, LinearRom, build_rom
 from hvac_controller.d1.spec import BuildingSpec, Exogenous
 
 EXO_STEP = ("t_amb", "t_amb_next", "comfort", "win_now", "win_next", "occ_step", "occ_rew", "price_e", "carbon_e",
             "price_g", "carbon_g", "max_cost", "max_carbon", "reward_dt")
 
 
-def replica_from_env(env, n_steps: int, log=None) -> tuple[BuildingSpec, LinearRom, Exogenous, np.ndarray, dict]:
-    """Spec, ROM and exogenous series of a freshly loaded environment, which this resets.
+def replica_parts(env, n_steps: int) -> tuple[BuildingSpec, Core, Exogenous, np.ndarray, dict]:
+    """Spec, thermal core, exogenous series and reset observation of a freshly loaded environment, which this resets;
+    and their build timings. The core holds copies only, so the environment can be dropped before ``build_rom``.
 
-    Returns them with the reset observation and the build timings. The occupancy object is copied before
-    ``env.reset()`` asks it anything, so the exogenous occupancy replays the environment's own draws.
+    The occupancy object is copied before ``env.reset()`` asks it anything, so the exogenous occupancy replays the
+    environment's own draws.
     """
     t0 = time.time()
     spec = BuildingSpec.from_env(env)
     occupancy = copy.deepcopy(env.building._occupancy)
     obs0 = env.reset()[0]
+    core = core_from_env(env)
     t1 = time.time()
-    rom, info = build_rom(core_from_env(env), log=log)
-    t2 = time.time()
     exo = Exogenous.from_env(env, spec, n_steps, occupancy)
-    timings = {"spec_s": t1 - t0, "rom_s": t2 - t1, "exo_s": time.time() - t2, "rom": info}
-    return spec, rom, exo, obs0, timings
+    return spec, core, exo, obs0, {"spec_s": t1 - t0, "exo_s": time.time() - t1}
+
+
+def replica_from_env(env, n_steps: int, log=None) -> tuple[BuildingSpec, LinearRom, Exogenous, np.ndarray, dict]:
+    """replica_parts with the ROM built: spec, ROM, exogenous series, reset observation, build timings."""
+    spec, core, exo, obs0, timings = replica_parts(env, n_steps)
+    t0 = time.time()
+    rom, info = build_rom(core, log=log)
+    return spec, rom, exo, obs0, {**timings, "rom_s": time.time() - t0, "rom": info}
 
 
 class ThermalRom:
@@ -160,7 +168,8 @@ class BuildingEnv:
         self.n_steps = exos[0].n_steps
         if any(e.n_steps != self.n_steps for e in exos):
             raise ValueError("exogenous series of different lengths")
-        self.o, self.spec, self.S, self.num_envs = o, specs[0], S, num_envs
+        self.o, self.spec, self.specs, self.S = o, specs[0], specs, S
+        self.exact, self.emulate_f32 = exact, emulate_f32
         self.plant = Plant(specs, o, exact=exact, emulate_f32=emulate_f32, n_rows=num_envs)
         self.rom = ThermalRom(roms, o, self.plant.max_air_conductance())
         # Exogenous series as one (S * n, F) table (per-zone columns padded): a step gathers one row per batch row.
@@ -173,16 +182,32 @@ class BuildingEnv:
             start += width
         self.exo = o.asarray(np.concatenate(cols, 2).reshape(S * self.n_steps, start))
         self.obs_exo = o.asarray(np.concatenate([e.obs_exo for e in exos]))  # (S * (n + 1), n_exo)
-        self.row_s = o.index(np.arange(num_envs) // (num_envs // S))  # scenario of each row
-        rows = np.arange(num_envs) // (num_envs // S)
+        self._set_rows(num_envs)
+
+    def _set_rows(self, num_envs: int) -> None:
+        """What depends on the number of rows (self.plant is already built for it)."""
+        o = self.o
+        self.num_envs = num_envs
+        rows = np.arange(num_envs) // (num_envs // self.S)
+        self.row_s = o.index(rows)  # scenario of each row
         self.init = {"x": o.asarray(self.rom.x0[rows]), "y": o.asarray(self.rom.y0[rows]),
-                     "tank": o.asarray(np.array([sp.tank0 for sp in specs])[rows]),
-                     "ret": o.asarray(np.array([sp.ret0 for sp in specs])[rows])}
+                     "tank": o.asarray(np.array([sp.tank0 for sp in self.specs])[rows]),
+                     "ret": o.asarray(np.array([sp.ret0 for sp in self.specs])[rows])}
         self.num_obs = self.plant.n_obs
         self.num_actions = (self.plant.n_cont, self.plant.n_disc)
         self.obs0 = self.plant.reset_obs(num_envs, self.obs_exo[self.row_s * (self.n_steps + 1)])
         self.k = None
         self.state = None
+
+    def resized(self, num_envs: int) -> "BuildingEnv":
+        """The same scenarios with num_envs rows. The ROM and exogenous tensors are shared, not copied: an evaluation
+        or burn-in next to a training environment costs only its rows."""
+        if num_envs % self.S:
+            raise ValueError(f"{num_envs} rows for {self.S} scenarios")
+        env = copy.copy(self)
+        env.plant = Plant(self.specs, self.o, exact=self.exact, emulate_f32=self.emulate_f32, n_rows=num_envs)
+        env._set_rows(num_envs)
+        return env
 
     # ---- episode ----------------------------------------------------------------------------------------------
     def reset(self):
@@ -222,9 +247,3 @@ class BuildingEnv:
             e[:, c["occ_rew"]], e[:, c["price_e"]], e[:, c["carbon_e"]], e[:, c["price_g"]], e[:, c["carbon_g"]],
             e[:, c["max_cost"]], e[:, c["max_carbon"]], e[:, c["reward_dt"]], obs_exo_next)
         return {"x": x_new, "y": y_new, "tank": out["tank"], "ret": out["ret"]}, out
-
-    def clear_grad(self) -> None:
-        """Cut the graph between the current state and everything before it (start of a gradient window)."""
-        if self.o.is_torch:
-            self.state = {k: v.detach() for k, v in self.state.items()}
-            self.obs = self.obs.detach()

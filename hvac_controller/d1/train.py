@@ -30,7 +30,9 @@ held-out scenarios when there are any, is kept: ``d1_policy.pt``, the file polic
   restart;
 - five skipped spikes in a row, a held-out score 15 % worse than the best on two evaluations in a row, or a moving
   average of the training reward 25 % worse than its best restore the saved best and halve the learning rate;
-- the time budget ends the run cleanly; ``last.pt`` is written every 15 minutes and ``--resume`` continues from it.
+- the time budget ends the run cleanly; ``last.pt`` is written every 15 minutes and ``--resume`` continues from it;
+- out of GPU memory before the first update halves ``row_budget`` and starts again; after it, the run stops with the
+  policy kept so far (a restart would overrun the session).
 """
 
 from __future__ import annotations
@@ -134,15 +136,15 @@ class Bucket:
     """Scenarios of one or several buildings as one padded environment, their layouts and start states."""
 
     def __init__(self, reps: list[dict], row_budget: int, seg: int, device: str, rows_per: int | None = None):
-        for r in reps:
-            Layout(r["meta"]).check(r["spec"])  # every scenario's metadata against its own simulator objects
         self.reps, self.S, self.device = reps, len(reps), device
         self.labels = [r["info"]["label"] for r in reps]
         self.layouts = [Layout(r["meta"]) for r in reps]
+        for lay, r in zip(self.layouts, reps):
+            lay.check(r["spec"])  # every scenario's metadata against its own simulator objects
         self.V = max(l.V for l in self.layouts)
-        self.ops = Ops("torch", dtype=torch.float32, device=device)
         self.rows = self.S * (rows_per or max(4, row_budget // (seg * self.V * self.S)))
-        self.env = self.make_env(self.rows)
+        self.env = BuildingEnv([r["spec"] for r in reps], [r["rom"] for r in reps], [r["exo"] for r in reps], self.rows,
+                               Ops("torch", dtype=torch.float32, device=device), exact=False, emulate_f32=False)
         self.lay = self.layout(self.rows)
         e = self.env
         self.fc_t = e.exo[:, e.exo_cols["t_amb"]]
@@ -155,8 +157,8 @@ class Bucket:
         self.start = None
 
     def make_env(self, rows: int) -> BuildingEnv:
-        return BuildingEnv([r["spec"] for r in self.reps], [r["rom"] for r in self.reps], [r["exo"] for r in self.reps],
-                           rows, self.ops, exact=False, emulate_f32=False)
+        """Another environment of these scenarios with its own rows (burn-in, evaluation), sharing the tensors."""
+        return self.env.resized(rows)
 
     def layout(self, rows: int) -> dict:
         return stack_layouts(self.layouts, np.arange(rows) // (rows // self.S), self.device)
@@ -243,9 +245,10 @@ class Trainer:
         buf = {"vav": [], "glob": [], "r": [], "done": []}
         d_mask = b.lay["d_mask"]
         for t in range(t0, t1):
-            cv, cg = self.critic_inputs(b, env, env.obs[sel], tuple(m[sel] for m in mem), sel, lay_sel)
-            buf["vav"].append(cv.detach())
-            buf["glob"].append(cg.detach())
+            with torch.no_grad():
+                cv, cg = self.critic_inputs(b, env, env.obs[sel], tuple(m[sel] for m in mem), sel, lay_sel)
+            buf["vav"].append(cv)
+            buf["glob"].append(cg)
             o = env.obs.detach() if cfg.detach_obs else env.obs
             a_c, a_d, mem = ctrl.act(o, mem, b.lay)
             if cfg.winsor > 0.0:
@@ -449,7 +452,7 @@ class Trainer:
                 frac = elapsed / budget
                 t_it = time.time()
                 acc_g = [torch.zeros_like(p) for p in params]
-                data, losses, rewards, ons, b_norms = [], [], [], [], []
+                data, b_norms = [], []
                 for b in self.buckets:
                     self.opt_a.zero_grad(set_to_none=False)
                     d = self.window(b, self._weight(b))
@@ -458,13 +461,11 @@ class Trainer:
                         if p.grad is not None:
                             a += p.grad
                     data.append(d)
-                    losses.append(float(d["loss"]))
-                    rewards.append(float(d["reward"]))
-                    ons.append(float(d["on"]))
                 for a, p in zip(acc_g, params):
                     p.grad = a
+                losses, rewards, ons, b_norms = torch.stack(  # one host sync for the buckets' statistics
+                    [torch.stack([d["loss"], d["reward"], d["on"], n]) for d, n in zip(data, b_norms)]).T.tolist()
                 norm, status = self.actor_step(frac, losses)
-                b_norms = [float(x) for x in b_norms]
                 if status == "bad":
                     bad += 1
                     self.lr_scale *= 0.5
@@ -646,7 +647,7 @@ def checkpoint_check(trainer: Trainer, b: Bucket) -> dict:
 
 def load_buckets(caches: list[Path], n_buckets: int, row_budget: int, seg: int, device: str,
                  rows_per: int | None = None) -> list[Bucket]:
-    """Caches (named <building>__<weather>.pkl by notebook 20) grouped by building, buildings sorted by size and
+    """Caches (named <building>__<weather>.pkl by data.ipynb) grouped by building, buildings sorted by size and
     split into n_buckets padded environments."""
     groups: dict[str, list[dict]] = {}
     for p in sorted(caches):
@@ -683,7 +684,8 @@ def main() -> None:
               "device_name": torch.cuda.get_device_name() if device == "cuda" else "cpu", "torch": torch.__version__}
     (out / "config.json").write_text(json.dumps(report, indent=1))
     t0 = time.time()
-    for attempt in range(4):  # out of memory at start-up: halve the rows
+    trainer = None
+    for attempt in range(4):  # out of memory before the first update: halve the rows and start again
         try:
             buckets = load_buckets(caches, cfg.buckets, cfg.row_budget, cfg.seg, device)
             val = load_buckets(val_caches, 1, 0, cfg.seg, device, rows_per=1)
@@ -713,6 +715,11 @@ def main() -> None:
             report.update(trainer.train())
             break
         except torch.cuda.OutOfMemoryError:
+            if trainer is not None and trainer.iteration > 0:  # mid-run: a restart would overrun the session
+                report.update(stopped=f"out of memory at iteration {trainer.iteration}", iterations=trainer.iteration,
+                              best=trainer.best)  # d1_policy.pt on disk is the best kept so far
+                log(f"[train] out of memory at iteration {trainer.iteration}: stopped, the kept policy stays")
+                break
             cfg.row_budget //= 2
             report.setdefault("oom_halvings", []).append(cfg.row_budget)
             log(f"[train] out of memory: row budget -> {cfg.row_budget}")

@@ -7,7 +7,7 @@ relabelled as 2023-01-01 00:00 + i hours. ``verify`` rebuilds all six from the
 EPW files and they are byte-identical. This script fetches the same product for
 every station (14,331 on 2026-10-17), keeps the four columns the shipped CSVs
 carry (dry-bulb, dew point, relative humidity, wind speed) and packs them into
-one ``data.zip`` of 1,000-station shards plus a station table.
+one ``weathertmyx.zip`` (the Kaggle dataset ``weathertmyx``) of 1,000-station shards plus a station table.
 
 Work directory layout (``--work-dir``, default ``weather_tmyx/``, git-ignored):
 
@@ -16,7 +16,7 @@ Work directory layout (``--work-dir``, default ``weather_tmyx/``, git-ignored):
     stations/<stem>.npz     fetch cache, one file per station: x100[8760, 4] + meta;
                             only needed until ``pack`` has run, delete it afterwards
     fetch_log.txt           failures and progress
-    packed/data.zip         ext_weather_tmyx_NN.npz shards + ext_weather_stations.csv
+    packed/weathertmyx.zip  ext_weather_tmyx_NN.npz shards + ext_weather_stations.csv
 
 Values are stored as integers x100: EPW carries at most two decimals, so the
 round trip is exact.
@@ -25,8 +25,8 @@ Usage (from the repo root):
     python -m hvac_controller.weather index    # crawl index pages
     python -m hvac_controller.weather list     # index pages -> station list
     python -m hvac_controller.weather fetch    # download + convert, resumable
-    python -m hvac_controller.weather pack     # cache -> packed/data.zip
-    python -m hvac_controller.weather verify   # rebuild the six shipped CSVs from data.zip
+    python -m hvac_controller.weather pack     # cache -> packed/weathertmyx.zip
+    python -m hvac_controller.weather verify   # rebuild the six shipped CSVs from the pack
 """
 
 from __future__ import annotations
@@ -78,7 +78,7 @@ class Paths:
         self.cache = work_dir / "stations"
         self.log = work_dir / "fetch_log.txt"
         self.packed = work_dir / "packed"
-        self.zip = self.packed / "data.zip"
+        self.zip = self.packed / "weathertmyx.zip"
 
 
 def curl(url: str) -> bytes:
@@ -185,7 +185,7 @@ def load_station(cache: Path, stem: str) -> tuple[np.ndarray, dict]:
 
 
 class Packed:
-    """Read stations from the packed data: ``data.zip`` or the folder Kaggle unpacks it into."""
+    """Read stations from the packed data: the zip, or the folder Kaggle unpacks it into."""
 
     def __init__(self, path: Path):
         path = Path(path)
@@ -207,13 +207,9 @@ class Packed:
 
 
 def find_packed(root: Path) -> Path:
-    """The packed weather under ``root``: an unpacked folder, else a data.zip."""
+    """The packed weather under ``root``: the folder Kaggle unpacks the dataset into."""
     for table in sorted(Path(root).rglob("ext_weather_stations.csv")):
         return table.parent
-    for z in sorted(Path(root).rglob("data.zip")):
-        with zipfile.ZipFile(z) as zf:
-            if "ext_weather_stations.csv" in zf.namelist():
-                return z
     raise FileNotFoundError(f"no packed TMYx weather under {root}")
 
 
@@ -226,15 +222,12 @@ def estimate_h(wind_mean_ms: float) -> float:
     return float(np.clip(1.7 + 5.3 * wind_mean_ms, *H_RANGE))
 
 
-def write_preset(packed: Packed, stem: str, weather_dir: Path, start_timestamp: str,
-                 h: float | None = None, name: str | None = None) -> Path:
+def write_preset(packed: Packed, stem: str, weather_dir: Path, start_timestamp: str, h: float, name: str) -> Path:
     """Write one station as a weather preset (shipped CSV layout + yaml) the scenario generator loads."""
     row = packed.table[stem]
-    name = name or f"tmyx_{stem}"
     csv_dir = Path(weather_dir) / "csv"
     csv_dir.mkdir(parents=True, exist_ok=True)
     (csv_dir / f"{name}.csv").write_text(to_weather_csv(packed.x100(stem), row["name"], row["country"]))
-    h = estimate_h(float(row["wind_mean_ms"])) if h is None else h
     yaml_path = Path(weather_dir) / f"{name}.yaml"
     yaml_path.write_text(
         f"name: {name}\nweather_csv: csv/{name}.csv\nconvection_coefficient: {h:.1f}\n"
@@ -274,7 +267,7 @@ def verify(paths: Paths) -> None:
 
 
 def pack(paths: Paths, shard_size: int) -> None:
-    # Shards go straight into data.zip (stored, the npz are already compressed); peak memory
+    # Shards go straight into the zip (stored, the npz are already compressed); peak memory
     # stays near 150 MB per 1,000 stations.
     stems = sorted(p.name[: -len(".npz")] for p in paths.cache.glob("*.npz") if not p.name.endswith(".tmp.npz"))
     paths.packed.mkdir(parents=True, exist_ok=True)

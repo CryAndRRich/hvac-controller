@@ -188,14 +188,14 @@ class Plant:
         if not self.grouped:
             gather, mean, std, plain, zero = layouts[0]
             self.obs_gather = o.index(gather)
-            self.obs_mean, self.obs_std = o.asarray(mean), o.asarray(std)
+            self.obs_mean = o.asarray(mean)
             self.obs_std_safe = o.asarray([s if s > 0.0 else 1.0 for s in std])
             self.obs_plain, self.obs_zero = o.asarray(plain) > 0.5, o.asarray(zero) > 0.5
         else:  # padded fields: zero (not plain, "zero variance")
             stack = (lambda j, fill: np.stack([_pad(lay[j], (n_obs,), fill) for lay in layouts])[row_s])
             self.obs_gather = o.index(stack(0, 0.0).astype(np.int64))
             self.obs_mean, std = o.asarray(stack(1, 0.0)), stack(2, 1.0)
-            self.obs_std, self.obs_std_safe = o.asarray(std), o.asarray(np.where(std > 0.0, std, 1.0))
+            self.obs_std_safe = o.asarray(np.where(std > 0.0, std, 1.0))
             self.obs_plain, self.obs_zero = o.asarray(stack(3, 0.0)) > 0.5, o.asarray(stack(4, 1.0)) > 0.5
         self.n_obs = n_obs
         self.reset_raw = {k: per_row(lambda s, k=k: s.reset_raw[k], (width[SOURCE_KIND[k]],)) for k in SOURCES}

@@ -9,10 +9,9 @@ z = (its mean - null mean) / sd (``compare``).
 Every run is one job, written to its own JSON file as soon as it finishes, so a long sharded evaluation can be
 restarted and skips what is done. Jobs run in fresh processes (the simulator keeps gin and occupancy state).
 
-Policies by name: ``k10`` (the baseline, hvac_controller.baseline_k10), ``trained:<path>`` (policy.KagglePolicy with
-the weights at path; in job file names the path becomes its parent folder's name), ``pkg:<dir>`` (a submission
-package: the KagglePolicy of the d1_policy.py in dir with its d1_policy.pt, so an earlier version runs with its own
-code; named after dir) or any key of the starter kit's POLICY_MAP.
+Policies by name: ``k10`` (the baseline, hvac_controller.baseline_k10) or ``pkg:<dir>`` (a submission package: the
+KagglePolicy of the d1_policy.py in dir with its d1_policy.pt, so every version runs with its own code; named after
+dir).
 """
 
 from __future__ import annotations
@@ -60,16 +59,10 @@ class NoisyPolicy:
 
 
 def make_policy(name: str, meta: dict, action_spec, spec, seed: int):
-    from smart_buildings import evaluate
-
     if name == "k10":
         from hvac_controller.baseline_k10 import SubmissionPolicy
 
         policy = SubmissionPolicy(meta, action_spec)
-    elif name.startswith("trained:"):
-        from hvac_controller.d1.policy import KagglePolicy
-
-        policy = KagglePolicy(meta, action_spec, weights=Path(name.split(":", 1)[1]))
     elif name.startswith("pkg:"):
         import importlib.util
 
@@ -79,7 +72,7 @@ def make_policy(name: str, meta: dict, action_spec, spec, seed: int):
         spec_file.loader.exec_module(module)
         policy = module.KagglePolicy(meta, action_spec, weights=d / "d1_policy.pt")
     else:
-        policy = evaluate.initialize_policy(evaluate.POLICY_MAP[name], meta, action_spec)
+        raise ValueError(f"unknown policy {name!r}: k10 or pkg:<dir>")
     return policy if seed == 0 else NoisyPolicy(policy, obs_noise_mask(spec), SIGMA, seed)
 
 
@@ -150,8 +143,6 @@ def run_replica(cache: str, policy: str, seed: int, n_steps: int) -> dict:
 
 
 def policy_tag(name: str) -> str:
-    if name.startswith("trained:"):
-        return Path(name.split(":", 1)[1]).parent.name
     return Path(name.split(":", 1)[1]).name if name.startswith("pkg:") else name
 
 
@@ -203,7 +194,7 @@ def ensembles(results: list[dict]) -> dict:
 
 def compare(ens: dict, candidate: str, null: str, where: str = "original", sd_floor: float = 0.005) -> dict:
     """Per scenario both are scored on: relative gap of the means and z = gap / sd, sd from both ensembles' spreads
-    with a floor of sd_floor x the null mean. K10 hardly moves under observation noise (notebook 20: sd 0 on 27 of 30
+    with a floor of sd_floor x the null mean. K10 hardly moves under observation noise (2026-10-19: sd 0 on 27 of 30
     scenarios), and the replica scores it within 0.7 %; the floor keeps z from dividing by zero."""
     out = {}
     for (w, scenario, policy), c in ens.items():
