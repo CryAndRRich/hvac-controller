@@ -31,8 +31,9 @@ held-out scenarios when there are any, is kept: ``d1_policy.pt``, the file polic
 - five skipped spikes in a row, a held-out score 15 % worse than the best on two evaluations in a row, or a moving
   average of the training reward 25 % worse than its best restore the saved best and halve the learning rate;
 - the time budget ends the run cleanly; ``last.pt`` is written every 15 minutes and ``--resume`` continues from it;
-- out of GPU memory before the first update halves ``row_budget`` and starts again; after it, the run stops with the
-  policy kept so far (a restart would overrun the session).
+- out of GPU memory before the first update restarts the process with half the ``row_budget`` (a fresh process: the
+  failed attempt's memory is not reliably freed in place); after it, the run stops with the policy kept so far (a
+  restart would overrun the session).
 """
 
 from __future__ import annotations
@@ -40,9 +41,10 @@ from __future__ import annotations
 import argparse
 import collections
 import copy
-import gc
 import json
 import math
+import os
+import sys
 import time
 import traceback
 from dataclasses import asdict, dataclass
@@ -73,8 +75,8 @@ class Config:
     h: int = 288
     gamma: float = 0.998
     lam: float = 0.95
-    seg: int = 24  # checkpointed segment of the window
-    row_budget: int = 2_870_000  # rows x seg x (padded) VAVs per bucket: ~12 GB on a T4
+    seg: int = 12  # checkpointed segment of the window
+    row_budget: int = 1_435_000  # rows x seg x (padded) VAVs per bucket: ~8 GB on a T4 (2.87M ran out at 14.4 GB)
     buckets: int = 3
     minutes: float = 30.0  # training time budget
     lr_actor: float = 2e-3
@@ -697,50 +699,49 @@ def main() -> None:
     (out / "config.json").write_text(json.dumps(report, indent=1))
     t0 = time.time()
     trainer = None
-    for attempt in range(4):  # out of memory before the first update: halve the rows and start again
-        try:
-            buckets = load_buckets(caches, cfg.buckets, cfg.row_budget, cfg.seg, device)
-            val = load_buckets(val_caches, 1, 0, cfg.seg, device, rows_per=1)
-            trainer = Trainer(cfg, buckets, val, device, out, log)
-            if a.resume:
-                trainer.load(a.resume)
-            log(f"[train] {len(buckets)} bucket(s): " + "; ".join(
-                f"{b.S} scenarios of {len({l.split('__')[0] for l in b.labels})} buildings, V <= {b.V}, rows {b.rows} "
-                f"({b.rows // b.S} per scenario), sweeps {b.env.rom.sweeps}" for b in buckets)
-                + f" | {sum(b.S for b in val)} held-out scenarios | setup {time.time() - t0:.0f}s")
-            if a.smoke and "parity" not in report:  # passed before an out-of-memory restart: not repeated
-                reps = [r for b in buckets + val for r in b.reps]
-                first = next(r for r in reps if Path(r["info"]["config"]).exists())  # the original simulator runs it
-                other = next(r for r in reps if r["info"]["label"].split("__")[0] != first["info"]["label"].split("__")[0])
-                report["parity"] = parity_check(trainer.ctrl, first, other, device, 36, out / "smoke_policy.pt")
-                log(f"[smoke] parity: {report['parity']}")
-                report["group"] = group_check([first, other], device)
-                log(f"[smoke] padded batch vs each building alone: {report['group']}")
-                small = Bucket([first, other], 0, cfg.seg, device, rows_per=4)
-                small.critic_rows = torch.arange(small.rows, device=device)
-                trainer.burn_in(small)
-                report["checkpoint"] = checkpoint_check(trainer, small)
-                log(f"[smoke] checkpointed vs plain gradient: {report['checkpoint']}")
-                del small, reps, first, other
-                if not (report["parity"]["ok"] and report["group"]["ok"] and report["checkpoint"]["ok"]):
-                    raise SystemExit("[smoke] a start-up check failed")
-            report.update(trainer.train())
-            break
-        except torch.cuda.OutOfMemoryError as e:
-            where = [f for f in traceback.extract_tb(e.__traceback__) if "hvac_controller" in f.filename][-1]
-            log(f"[train] out of memory in {where.name} ({where.filename.split('/')[-1]}:{where.lineno}), "
-                f"{torch.cuda.memory_allocated() / 2 ** 30:.1f} GB allocated: {str(e).splitlines()[0]}")
-            if trainer is not None and trainer.iteration > 0:  # mid-run: a restart would overrun the session
-                report.update(stopped=f"out of memory at iteration {trainer.iteration}", iterations=trainer.iteration,
-                              best=trainer.best)  # d1_policy.pt on disk is the best kept so far
-                log(f"[train] out of memory at iteration {trainer.iteration}: stopped, the kept policy stays")
-                break
-            cfg.row_budget //= 2
-            report.setdefault("oom_halvings", []).append(cfg.row_budget)
-            log(f"[train] row budget -> {cfg.row_budget}")
-        buckets = val = trainer = None
-        gc.collect()  # the failed attempt's tensors sit in reference cycles through its traceback
-        torch.cuda.empty_cache()
+    try:
+        buckets = load_buckets(caches, cfg.buckets, cfg.row_budget, cfg.seg, device)
+        val = load_buckets(val_caches, 1, 0, cfg.seg, device, rows_per=1)
+        trainer = Trainer(cfg, buckets, val, device, out, log)
+        if a.resume:
+            trainer.load(a.resume)
+        log(f"[train] {len(buckets)} bucket(s): " + "; ".join(
+            f"{b.S} scenarios of {len({l.split('__')[0] for l in b.labels})} buildings, V <= {b.V}, rows {b.rows} "
+            f"({b.rows // b.S} per scenario), sweeps {b.env.rom.sweeps}" for b in buckets)
+            + f" | {sum(b.S for b in val)} held-out scenarios | row budget {cfg.row_budget} "
+              f"| setup {time.time() - t0:.0f}s")
+        if a.smoke:
+            reps = [r for b in buckets + val for r in b.reps]
+            first = next(r for r in reps if Path(r["info"]["config"]).exists())  # the original simulator runs it
+            other = next(r for r in reps if r["info"]["label"].split("__")[0] != first["info"]["label"].split("__")[0])
+            report["parity"] = parity_check(trainer.ctrl, first, other, device, 36, out / "smoke_policy.pt")
+            log(f"[smoke] parity: {report['parity']}")
+            report["group"] = group_check([first, other], device)
+            log(f"[smoke] padded batch vs each building alone: {report['group']}")
+            small = Bucket([first, other], 0, cfg.seg, device, rows_per=4)
+            small.critic_rows = torch.arange(small.rows, device=device)
+            trainer.burn_in(small)
+            report["checkpoint"] = checkpoint_check(trainer, small)
+            log(f"[smoke] checkpointed vs plain gradient: {report['checkpoint']}")
+            del small, reps, first, other
+            if not (report["parity"]["ok"] and report["group"]["ok"] and report["checkpoint"]["ok"]):
+                raise SystemExit("[smoke] a start-up check failed")
+        report.update(trainer.train())
+    except torch.cuda.OutOfMemoryError as e:
+        where = [f for f in traceback.extract_tb(e.__traceback__) if "hvac_controller" in f.filename][-1]
+        log(f"[train] out of memory in {where.name} ({where.filename.split('/')[-1]}:{where.lineno}), "
+            f"{torch.cuda.memory_allocated() / 2 ** 30:.1f} GB allocated: {str(e).splitlines()[0]}")
+        if trainer is not None and trainer.iteration > 0:  # mid-run: a restart would overrun the session
+            report.update(stopped=f"out of memory at iteration {trainer.iteration}", iterations=trainer.iteration,
+                          best=trainer.best)  # d1_policy.pt on disk is the best kept so far
+            log(f"[train] out of memory at iteration {trainer.iteration}: stopped, the kept policy stays")
+        elif cfg.row_budget // 2 >= Config.row_budget // 8:  # before the first update: half the rows, a fresh process
+            args = sys.argv[1:]
+            if "--row-budget" in args:
+                del args[args.index("--row-budget"):args.index("--row-budget") + 2]
+            log(f"[train] restarting with row budget {cfg.row_budget // 2}")
+            os.execv(sys.executable, [sys.executable, "-m", "hvac_controller.d1.train", *args,
+                                      "--row-budget", str(cfg.row_budget // 2)])
     report["seconds"] = time.time() - t0
     (out / "report.json").write_text(json.dumps(report, indent=1, default=str))
     log(f"[train] done: best replica score {report.get('best')} after {report.get('iterations')} iterations")
