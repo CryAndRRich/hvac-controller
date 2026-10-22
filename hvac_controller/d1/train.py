@@ -40,9 +40,11 @@ from __future__ import annotations
 import argparse
 import collections
 import copy
+import gc
 import json
 import math
 import time
+import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -58,6 +60,12 @@ from hvac_controller.d1.policy import Controller, Layout, _mlp, save_policy, sta
 from hvac_controller.d1.torch_env import BuildingEnv
 
 AHEAD = 24  # hours of outside temperature and comfort flags the critic sees
+CRITIC_CHUNK = 1 << 19  # rows x VAVs per critic pass: its (rows, VAVs, width) activations dominate its memory
+
+
+def _chunk(x_vav) -> int:
+    """Rows per critic pass over (rows, VAVs, features) inputs."""
+    return max(1, CRITIC_CHUNK // x_vav.shape[1])
 
 
 @dataclass
@@ -341,21 +349,25 @@ class Trainer:
             for d in data:
                 h1, n = d["glob"].shape[:2]  # h + 1 states of n rows
                 mask = d["mask"].expand(n, -1)
-                v = self.target(d["vav"][1:].flatten(0, 1), d["glob"][1:].flatten(0, 1), mask.repeat(h1 - 1, 1))
+                X_v, X_g, M = d["vav"][1:].flatten(0, 1), d["glob"][1:].flatten(0, 1), mask.repeat(h1 - 1, 1)
+                step = _chunk(X_v)
+                v = torch.cat([self.target(X_v[i:i + step], X_g[i:i + step], M[i:i + step])
+                               for i in range(0, len(M), step)])
                 v = torch.where(d["done"], torch.zeros_like(v.view(h1 - 1, n)), v.view(h1 - 1, n))
                 G = td_lambda(d["r"], d["done"], v, cfg.gamma, cfg.lam)
-                sets.append((d["vav"][:-1].flatten(0, 1), d["glob"][:-1].flatten(0, 1), mask.repeat(h1 - 1, 1),
-                             G.flatten()))
+                sets.append((d["vav"][:-1].flatten(0, 1), d["glob"][:-1].flatten(0, 1), M, G.flatten()))
         total = torch.zeros((), device=self.device)
         for _ in range(cfg.critic_iters):
             for X_v, X_g, M, Y in sets:
+                step = _chunk(X_v)
                 for idx in torch.randperm(len(Y), device=self.device).chunk(cfg.critic_batches):
-                    loss = ((self.critic(X_v[idx], X_g[idx], M[idx]) - Y[idx]) ** 2).mean()
                     self.opt_c.zero_grad(set_to_none=True)
-                    loss.backward()
+                    for j in idx.split(step):  # the minibatch's mean loss, accumulated in pieces that fit
+                        loss = ((self.critic(X_v[j], X_g[j], M[j]) - Y[j]) ** 2).sum() / len(idx)
+                        loss.backward()
+                        total += loss.detach()
                     torch.nn.utils.clip_grad_norm_(self.critic.parameters(), cfg.clip)
                     self.opt_c.step()
-                    total += loss.detach()
         with torch.no_grad():
             for t, c in zip(self.target.parameters(), self.critic.parameters()):
                 t.mul_(cfg.target_keep).add_(c, alpha=1.0 - cfg.target_keep)
@@ -696,7 +708,7 @@ def main() -> None:
                 f"{b.S} scenarios of {len({l.split('__')[0] for l in b.labels})} buildings, V <= {b.V}, rows {b.rows} "
                 f"({b.rows // b.S} per scenario), sweeps {b.env.rom.sweeps}" for b in buckets)
                 + f" | {sum(b.S for b in val)} held-out scenarios | setup {time.time() - t0:.0f}s")
-            if a.smoke:
+            if a.smoke and "parity" not in report:  # passed before an out-of-memory restart: not repeated
                 reps = [r for b in buckets + val for r in b.reps]
                 first = next(r for r in reps if Path(r["info"]["config"]).exists())  # the original simulator runs it
                 other = next(r for r in reps if r["info"]["label"].split("__")[0] != first["info"]["label"].split("__")[0])
@@ -709,12 +721,15 @@ def main() -> None:
                 trainer.burn_in(small)
                 report["checkpoint"] = checkpoint_check(trainer, small)
                 log(f"[smoke] checkpointed vs plain gradient: {report['checkpoint']}")
-                del small
+                del small, reps, first, other
                 if not (report["parity"]["ok"] and report["group"]["ok"] and report["checkpoint"]["ok"]):
                     raise SystemExit("[smoke] a start-up check failed")
             report.update(trainer.train())
             break
-        except torch.cuda.OutOfMemoryError:
+        except torch.cuda.OutOfMemoryError as e:
+            where = [f for f in traceback.extract_tb(e.__traceback__) if "hvac_controller" in f.filename][-1]
+            log(f"[train] out of memory in {where.name} ({where.filename.split('/')[-1]}:{where.lineno}), "
+                f"{torch.cuda.memory_allocated() / 2 ** 30:.1f} GB allocated: {str(e).splitlines()[0]}")
             if trainer is not None and trainer.iteration > 0:  # mid-run: a restart would overrun the session
                 report.update(stopped=f"out of memory at iteration {trainer.iteration}", iterations=trainer.iteration,
                               best=trainer.best)  # d1_policy.pt on disk is the best kept so far
@@ -722,12 +737,15 @@ def main() -> None:
                 break
             cfg.row_budget //= 2
             report.setdefault("oom_halvings", []).append(cfg.row_budget)
-            log(f"[train] out of memory: row budget -> {cfg.row_budget}")
-            buckets = val = trainer = None
-            torch.cuda.empty_cache()
+            log(f"[train] row budget -> {cfg.row_budget}")
+        buckets = val = trainer = None
+        gc.collect()  # the failed attempt's tensors sit in reference cycles through its traceback
+        torch.cuda.empty_cache()
     report["seconds"] = time.time() - t0
     (out / "report.json").write_text(json.dumps(report, indent=1, default=str))
     log(f"[train] done: best replica score {report.get('best')} after {report.get('iterations')} iterations")
+    if not report.get("iterations"):
+        raise SystemExit("[train] no update completed")
 
 
 if __name__ == "__main__":
