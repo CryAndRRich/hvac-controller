@@ -13,7 +13,7 @@ import traceback
 
 import numpy as np
 
-MPC_CONFIG = "meta.rp24.lag6"
+MPC_CONFIG = "meta.rp24.lag6.guard300.cw200"
 
 
 class D2Policy:

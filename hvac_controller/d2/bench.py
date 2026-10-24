@@ -1,6 +1,6 @@
 """Direction 2: how long the planner's rollouts take on this machine, before committing a long run to them.
 
-Loads one replica cache, steps a batched float32 torch model of ``--n`` rows driven by the low-level controller, and
+Loads one replica cache, steps a batched float32 NumPy model of ``--n`` rows driven by the low-level controller, and
 projects the cost of one replan and of a whole episode for an MPC configuration (mpc.parse_config).
 
     python -m hvac_controller.d2.bench <cache.pkl> --mpc oracle --threads 1
@@ -13,7 +13,6 @@ import time
 from pathlib import Path
 
 import numpy as np
-import torch
 
 
 def main() -> None:
@@ -34,8 +33,8 @@ def main() -> None:
     t0 = time.perf_counter()
     pol = MPCPolicy(rep["meta"], rep["action_spec"], cfg, rep["spec"], rep["rom"], exo=rep["exo"])
     build_s = time.perf_counter() - t0
-    snap = pol._snapshot(torch.as_tensor(np.asarray(pol.model.obs0[:1], dtype=np.float32)))
-    cand = torch.rand(cfg["n"], 1, 6)
+    snap = pol._snapshot(np.asarray(pol.model.obs0[:1], dtype=np.float32))
+    cand = np.random.default_rng(0).random((cfg["n"], 1, 6))
     pol._rollout(cand, [2], snap)  # warm-up
     t0 = time.perf_counter()
     pol._rollout(cand, [a.steps], snap)

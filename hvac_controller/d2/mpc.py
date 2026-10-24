@@ -2,7 +2,7 @@
 
 Every ``rp`` steps the planner searches the next ``h`` steps of supervisory decisions (lowlevel.DEC, one vector per
 block; blocks are short near the present and longer further out) by the cross-entropy method: ``n`` candidate plans
-are rolled out in a batched float32 copy of the model from the current state, each driven by the same low-level
+are rolled out in a batched float32 NumPy copy of the model from the current state, each driven by the same low-level
 controller the live building runs, and scored with the competition's own reward. The best plan seen is executed
 until the next replan, which warm-starts from it shifted in time. The default plan (K10's schedule) is always a
 candidate, so in the model the executed plan is never worse than K10's.
@@ -25,7 +25,6 @@ import re
 import time
 
 import numpy as np
-import torch
 
 from hvac_controller.d1.ops import Ops
 from hvac_controller.d1.torch_env import BuildingEnv
@@ -33,7 +32,7 @@ from hvac_controller.d2.lowlevel import LowLevel
 
 _BASE = {"n": 48, "it": 3, "el": 6, "h": 144, "rp": 12, "blocks": (12, 12, 12, 12, 24, 24, 48), "sigma": 0.2,
          "sigma_run": 0.35, "min_sigma": 0.03, "seed": 0, "threads": 1, "obs": 100, "ridge": 100, "occ": 150,
-         "ep": 8640, "lag": 0}
+         "ep": 8640, "lag": 0, "cw": 100, "guard": 0}
 PRESETS = {
     # 12 h ahead in blocks of 1, 1, 1, 1, 2, 2, 4 h; replan every hour.
     "oracle": dict(_BASE, source="oracle"),
@@ -41,8 +40,10 @@ PRESETS = {
 }
 # Integer overrides: obs = observer gain per mille, ridge = its regularisation per mille of the mean sensor gain,
 # occ = prior occupants per zone x 100, ep = episode steps, lag = steps between a plan's request and its use (0:
-# plan synchronously; > 0: on the planner thread, overlapping the simulator).
-SHORT = ("n", "it", "el", "h", "rp", "seed", "threads", "obs", "ridge", "occ", "ep", "lag")
+# plan synchronously; > 0: on the planner thread, overlapping the simulator), cw = weight of the comfort term in
+# the planner's objective x 100 (above 100: plans keep a margin against model and forecast error), guard = comfort
+# guard margin in mK (0: off; see MPCPolicy._guard).
+SHORT = ("n", "it", "el", "h", "rp", "seed", "threads", "obs", "ridge", "occ", "ep", "lag", "cw", "guard")
 OCC_NORM = 125.0  # evaluate.py / sim.load_env: the observation's occupancy normalisation constant
 
 
@@ -92,7 +93,6 @@ class MPCPolicy:
     def __init__(self, meta: dict, action_spec, cfg: dict, spec, rom, exo=None, model_env=None):
         """``exo``: the scenario's own series (oracle). Without it (meta), the series is built from ``model_env``'s
         schedule when the first observation gives the time of day and day of week."""
-        torch.set_num_threads(cfg["threads"])
         self.cfg, self.meta, self.action_spec = cfg, meta, action_spec
         self.spec, self.rom, self.model_env = spec, rom, model_env
         self.ll = self.ll_live = LowLevel(meta)
@@ -101,8 +101,8 @@ class MPCPolicy:
         self.i_oat, self.c_oat = lay.i_temps[0], lay.c_temps[0]
         self.i_occ = self.field_names.index("num_occupants")
         self.occ_per_zone = cfg["occ"] / 100.0
-        self.integral = torch.zeros(1, self.ll.V)
-        self.gen = torch.Generator().manual_seed(cfg["seed"])
+        self.integral = np.zeros((1, self.ll.V), dtype=np.float32)
+        self.rng = np.random.default_rng(cfg["seed"])
         self.k, self.plan, self.plan_k = 0, None, 0
         self._pending, self._requested, self._executor, self._model_occ_scale = None, 0, None, 1.0
         self.oat: list[float] = []
@@ -116,7 +116,7 @@ class MPCPolicy:
         self.n_steps = exo.n_steps
         self.track = BuildingEnv(self.spec, self.rom, exo, 1, Ops("numpy"))
         self.track.reset()
-        self.model = BuildingEnv(self.spec, self.rom, exo, self.cfg["n"], Ops("torch", dtype=torch.float32),
+        self.model = BuildingEnv(self.spec, self.rom, exo, self.cfg["n"], Ops("numpy", dtype=np.float32),
                                  emulate_f32=False)
         self.model.reset()
         self.active = _active(np.asarray(exo.comfort))
@@ -198,26 +198,28 @@ class MPCPolicy:
         edges = np.cumsum([0] + lengths)
         return np.stack([steps[a:b].mean(0) for a, b in zip(edges[:-1], edges[1:])])
 
-    def _rollout(self, cand: torch.Tensor, lengths: list[int], snap: dict) -> torch.Tensor:
+    def _rollout(self, cand: np.ndarray, lengths: list[int], snap: dict) -> np.ndarray:
         """Total model reward of each candidate (N, blocks, 6) from the snapshot's state."""
         m, N = self.model, cand.shape[0]
-        m.state = {name: torch.as_tensor(v, dtype=torch.float32).expand(N, *v.shape[1:]).clone()
-                   for name, v in snap["state"].items()}
-        m.k = torch.full((N,), snap["k"], dtype=torch.long)
-        m.obs = snap["obs"].expand(N, -1).clone()
-        integral = snap["integral"].expand(N, -1).clone()
-        steps = torch.repeat_interleave(cand, torch.as_tensor(lengths), dim=1)  # (N, H, 6)
-        total = torch.zeros(N)
+        m.state = {name: np.repeat(np.asarray(v, dtype=np.float32), N, axis=0) for name, v in snap["state"].items()}
+        m.k = np.full(N, snap["k"], dtype=np.int64)
+        m.obs = np.repeat(snap["obs"], N, axis=0)
+        integral = np.repeat(snap["integral"], N, axis=0)
+        steps = np.repeat(cand, lengths, axis=1).astype(np.float32)  # (N, H, 6)
+        extra = (self.cfg["cw"] / 100.0 - 1.0) * self.spec.reward["w_prod"]
+        total = np.zeros(N)
         for t in range(steps.shape[1]):
             a_c, a_d, integral = self.ll.act(m.obs, integral, steps[:, t])
-            _, reward, _, _ = m.step(a_c, a_d)
+            _, reward, _, info = m.step(a_c, a_d)
             total += reward
+            if extra:
+                total += extra * info["post"]["regret"]
         return total
 
-    def _snapshot(self, obs: torch.Tensor) -> dict:
+    def _snapshot(self, obs: np.ndarray) -> dict:
         """Everything a plan starts from, copied, so the planner can run while the live building moves on."""
         H = min(self.cfg["h"], self.n_steps - self.k)
-        snap = {"k": self.k, "H": H, "obs": obs.clone(), "integral": self.integral.clone(),
+        snap = {"k": self.k, "H": H, "obs": obs.copy(), "integral": self.integral.copy(),
                 "state": {name: np.array(v, copy=True) for name, v in self.track.state.items()},
                 "plan": self.plan, "plan_k": self.plan_k, "occ_scale": self._model_occ_scale}
         self._model_occ_scale = 1.0
@@ -225,13 +227,13 @@ class MPCPolicy:
             snap["forecast"] = self._forecast(H + 1)
         return snap
 
-    def _replan(self, obs: torch.Tensor) -> None:
+    def _replan(self, obs: np.ndarray) -> None:
         """Plan now and execute it from now on."""
         self.plan, self.plan_k = self._plan(self._snapshot(obs))
 
     def _plan(self, snap: dict) -> tuple[np.ndarray, int]:
         """The best plan (per step, from snap['k']) the cross-entropy search finds in the model. Touches only the
-        model, the generator and the stats, so it may run on the planner thread."""
+        model, the random generator and the stats, so it may run on the planner thread."""
         cfg, t0, k, H = self.cfg, time.perf_counter(), snap["k"], snap["H"]
         if snap["occ_scale"] != 1.0:
             for name in ("occ_step", "occ_rew"):
@@ -247,32 +249,30 @@ class MPCPolicy:
         if snap["plan"] is not None:  # the last plan, shifted to now, then the default
             rest = snap["plan"][k - snap["plan_k"]:][:H]
             warm[:len(rest)] = rest
-        mean = torch.as_tensor(self._to_blocks(warm, lengths), dtype=torch.float32)
-        fixed = [mean.clone(), torch.as_tensor(self._to_blocks(default, lengths), dtype=torch.float32)]
-        sigma = torch.full_like(mean, cfg["sigma"])
+        mean = self._to_blocks(warm, lengths)
+        fixed = [mean.copy(), self._to_blocks(default, lengths)]
+        sigma = np.full_like(mean, cfg["sigma"])
         sigma[:, 0] = cfg["sigma_run"]
         best, best_r, default_r = None, -math.inf, None
-        with torch.no_grad():
-            for _ in range(cfg["it"]):
-                noise = torch.randn((cfg["n"],) + tuple(mean.shape), generator=self.gen)
-                cand = torch.clamp(mean + sigma * noise, 0.0, 1.0)
-                for j, f in enumerate(fixed + ([best] if best is not None else [])):
-                    cand[j] = f
-                r = torch.nan_to_num(self._rollout(cand, lengths, snap), nan=-1e9, posinf=-1e9, neginf=-1e9)
-                if default_r is None:
-                    default_r = float(r[1])
-                i = int(torch.argmax(r))
-                if float(r[i]) > best_r:
-                    best, best_r = cand[i].clone(), float(r[i])
-                elite = cand[torch.topk(r, cfg["el"]).indices]
-                mean, sigma = elite.mean(0), torch.clamp(elite.std(0), min=cfg["min_sigma"])
+        for _ in range(cfg["it"]):
+            cand = np.clip(mean + sigma * self.rng.standard_normal((cfg["n"],) + mean.shape), 0.0, 1.0)
+            for j, f in enumerate(fixed + ([best] if best is not None else [])):
+                cand[j] = f
+            r = np.nan_to_num(self._rollout(cand, lengths, snap), nan=-1e9, posinf=-1e9, neginf=-1e9)
+            if default_r is None:
+                default_r = float(r[1])
+            i = int(np.argmax(r))
+            if r[i] > best_r:
+                best, best_r = cand[i].copy(), float(r[i])
+            elite = cand[np.argsort(r)[-cfg["el"]:]]
+            mean, sigma = elite.mean(0), np.maximum(elite.std(0, ddof=1), cfg["min_sigma"])
         self.stats["replans"] += 1
         self.stats["plan_s"] += time.perf_counter() - t0
         self.stats["gain"].append((best_r - default_r) / H)  # model reward per step over the default plan
-        return np.repeat(best.numpy(), lengths, axis=0), k
+        return np.repeat(best, lengths, axis=0), k
 
     # ---- acting ----------------------------------------------------------------------------------------------
-    def _schedule_plans(self, o: torch.Tensor) -> None:
+    def _schedule_plans(self, o: np.ndarray) -> None:
         """Replan every rp steps. With ``lag`` > 0 a plan is searched on the planner thread from the state at the
         request and put in force exactly ``lag`` steps later (waiting for it if needed), while the live building
         keeps executing the previous plan: the search overlaps the simulator's own steps, and the outcome does not
@@ -293,6 +293,29 @@ class MPCPolicy:
             self._requested = self.k
             self._pending = (self.k + lag, self._executor.submit(self._plan, self._snapshot(o)))
 
+    def _guard(self, obs: np.ndarray, dec: np.ndarray) -> np.ndarray:
+        """While people are in, a zone closer than ``guard`` mK to a comfort limit gets the plant now rather than at
+        the next replan: units on, the band centre as target, and at least K10's cooling (supply 288 K) when a zone
+        is warm or its hot water (330 K) when one is cold. Comfort is 60 % of the score and unbounded; a plan is only
+        as good as the model and the forecast behind it."""
+        margin = self.cfg["guard"] / 1000.0
+        if margin <= 0.0 or float(obs[self.i_occ]) <= 0.5:  # the raw occupant count
+            return dec
+        temps = self.ll.zone_temps(obs[None])[0]
+        lo, hi = self.ll.band
+        warm, cold = bool((temps > hi - margin).any()), bool((temps < lo + margin).any())
+        if not (warm or cold):
+            return dec
+        self.stats["guard"] = self.stats.get("guard", 0) + 1
+        safe = self.ll.default_decision(np.ones(1))[0]
+        out = dec.copy()
+        out[0], out[1] = 1.0, 0.5
+        if warm:
+            out[2] = min(out[2], safe[2])
+        if cold:
+            out[5] = max(out[5], safe[5])
+        return out
+
     def get_action(self, obs) -> dict:
         obs = np.asarray(obs, dtype=np.float32)
         live = self.track is None or self.k < self.n_steps
@@ -305,14 +328,12 @@ class MPCPolicy:
                 self._update_occupancy(obs)
             _set_exo(self.track, "t_amb", self.k, [oat])
             _set_exo(self.track, "t_amb_next", self.k, [oat])
-        o = torch.as_tensor(obs)[None]
+        o = obs[None]
         if live:
             self._schedule_plans(o)
         i = min(self.k - self.plan_k, len(self.plan) - 1)
-        d = torch.as_tensor(self.plan[i], dtype=torch.float32)[None]
-        with torch.no_grad():
-            a_c, a_d, self.integral = self.ll.act(o, self.integral, d)
-        a_c, a_d = a_c[0].numpy().astype(np.float32), a_d[0].numpy().round().astype(np.int32)
+        a_c, a_d, self.integral = self.ll.act(o, self.integral, self._guard(obs, self.plan[i])[None])
+        a_c, a_d = a_c[0].astype(np.float32), a_d[0].round().astype(np.int32)
         if live:  # the gateway may ask once more after the last scored step
             self.track.step(a_c[None].astype(np.float64), a_d[None].astype(np.float64))
         self.k += 1

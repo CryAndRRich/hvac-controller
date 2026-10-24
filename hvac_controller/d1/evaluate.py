@@ -124,7 +124,7 @@ def run_original(config: str, policy: str, seed: int, n_steps: int, cache: str |
         gain, err = np.asarray(stats["gain"]), np.asarray(stats.get("obs_err", []))
         out["mpc"] = {"replans": stats["replans"], "plan_s": stats["plan_s"],
                       "gain_mean": float(gain.mean()) if gain.size else 0.0,
-                      "obs_err_k": float(err.mean()) if err.size else 0.0}
+                      "obs_err_k": float(err.mean()) if err.size else 0.0, "guard": stats.get("guard", 0)}
     return out
 
 
