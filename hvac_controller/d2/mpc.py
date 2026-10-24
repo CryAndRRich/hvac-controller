@@ -245,6 +245,9 @@ class MPCPolicy:
             _set_exo(self.model, "t_amb_next", k, f[1:H + 1])
         lengths = self._lengths(H)
         default = self.ll.default_decision(self.active[k:k + H])
+        if self.active[k:k + H].max() < 0.5:  # nobody due within the horizon (weekend, holiday): all off, no search
+            self.stats["skipped"] = self.stats.get("skipped", 0) + 1
+            return default, k
         warm = default.copy()
         if snap["plan"] is not None:  # the last plan, shifted to now, then the default
             rest = snap["plan"][k - snap["plan_k"]:][:H]
