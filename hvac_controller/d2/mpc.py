@@ -32,18 +32,22 @@ from hvac_controller.d2.lowlevel import LowLevel
 
 _BASE = {"n": 48, "it": 3, "el": 6, "h": 144, "rp": 12, "blocks": (12, 12, 12, 12, 24, 24, 48), "sigma": 0.2,
          "sigma_run": 0.35, "min_sigma": 0.03, "seed": 0, "threads": 1, "obs": 100, "ridge": 100, "occ": 150,
-         "ep": 8640, "lag": 0, "cw": 100, "guard": 0}
+         "ep": 8640, "lag": 0, "cw": 100, "guard": 0, "pa": 0, "hs": 0, "db": 0}
 PRESETS = {
     # 12 h ahead in blocks of 1, 1, 1, 1, 2, 2, 4 h; replan every hour.
     "oracle": dict(_BASE, source="oracle"),
     "meta": dict(_BASE, source="meta"),
+    # Diagnostic: how far planning alone can go. The true model, decisions per AHU, a day ahead, a large search.
+    "heavy": dict(_BASE, source="oracle", pa=1, n=128, it=5, el=12, h=288, blocks=(12, 12, 12, 12, 24, 24, 48, 48, 96)),
 }
 # Integer overrides: obs = observer gain per mille, ridge = its regularisation per mille of the mean sensor gain,
 # occ = prior occupants per zone x 100, ep = episode steps, lag = steps between a plan's request and its use (0:
 # plan synchronously; > 0: on the planner thread, overlapping the simulator), cw = weight of the comfort term in
 # the planner's objective x 100 (above 100: plans keep a margin against model and forecast error), guard = comfort
-# guard margin in mK (0: off; see MPCPolicy._guard).
-SHORT = ("n", "it", "el", "h", "rp", "seed", "threads", "obs", "ridge", "occ", "ep", "lag", "cw", "guard")
+# guard margin in mK (0: off; see MPCPolicy._guard), pa = decisions per AHU (1) or one for all (0), hs = sequenced
+# heating in the low-level controller (lowlevel.LowLevel, heat_seq), db = its heating/cooling deadband: heat to the
+# band floor + db mK (0: one PI loop, as K10).
+SHORT = ("n", "it", "el", "h", "rp", "seed", "threads", "obs", "ridge", "occ", "ep", "lag", "cw", "guard", "pa", "hs", "db")
 OCC_NORM = 125.0  # evaluate.py / sim.load_env: the observation's occupancy normalisation constant
 
 
@@ -90,18 +94,18 @@ def _set_exo(env: BuildingEnv, name: str, k0: int, values) -> None:
 
 
 class MPCPolicy:
-    def __init__(self, meta: dict, action_spec, cfg: dict, spec, rom, exo=None, model_env=None):
-        """``exo``: the scenario's own series (oracle). Without it (meta), the series is built from ``model_env``'s
+    def __init__(self, meta: dict, action_spec, cfg: dict, spec, rom, exo=None, model_ctx=None):
+        """``exo``: the scenario's own series (oracle). Without it (meta), the series is built from ``model_ctx``'s
         schedule when the first observation gives the time of day and day of week."""
         self.cfg, self.meta, self.action_spec = cfg, meta, action_spec
-        self.spec, self.rom, self.model_env = spec, rom, model_env
-        self.ll = self.ll_live = LowLevel(meta)
+        self.spec, self.rom, self.model_ctx = spec, rom, model_ctx
+        self.ll = LowLevel(meta, per_ahu=bool(cfg["pa"]), heat_seq=bool(cfg["hs"]), deadband=cfg["db"] / 1000.0)
         self.field_names = list(meta["observation_field_names"])
         lay = self.ll.lay
         self.i_oat, self.c_oat = lay.i_temps[0], lay.c_temps[0]
         self.i_occ = self.field_names.index("num_occupants")
         self.occ_per_zone = cfg["occ"] / 100.0
-        self.integral = np.zeros((1, self.ll.V), dtype=np.float32)
+        self.integral = np.zeros((1, self.ll.n_int), dtype=np.float32)
         self.rng = np.random.default_rng(cfg["seed"])
         self.k, self.plan, self.plan_k = 0, None, 0
         self._pending, self._requested, self._executor, self._model_occ_scale = None, 0, None, 1.0
@@ -141,7 +145,7 @@ class MPCPolicy:
 
         start = start_from_obs(obs, self.field_names)
         n = self.cfg["ep"] + self.cfg["h"] + 2
-        self._init_models(exogenous(self.model_env, self.spec, start, n, self.occ_per_zone, self.oat[-1]))
+        self._init_models(exogenous(self.model_ctx, self.spec, start, n, self.occ_per_zone, self.oat[-1]))
         self.presence = np.asarray(self.exo.occ_rew[:, 0]) / self.occ_per_zone  # expected share present
 
     def _correct(self, obs: np.ndarray) -> None:
@@ -255,7 +259,7 @@ class MPCPolicy:
         mean = self._to_blocks(warm, lengths)
         fixed = [mean.copy(), self._to_blocks(default, lengths)]
         sigma = np.full_like(mean, cfg["sigma"])
-        sigma[:, 0] = cfg["sigma_run"]
+        sigma[:, self.ll.cols["run"]] = cfg["sigma_run"]
         best, best_r, default_r = None, -math.inf, None
         for _ in range(cfg["it"]):
             cand = np.clip(mean + sigma * self.rng.standard_normal((cfg["n"],) + mean.shape), 0.0, 1.0)
@@ -311,12 +315,13 @@ class MPCPolicy:
             return dec
         self.stats["guard"] = self.stats.get("guard", 0) + 1
         safe = self.ll.default_decision(np.ones(1))[0]
+        c = self.ll.cols
         out = dec.copy()
-        out[0], out[1] = 1.0, 0.5
+        out[c["run"]], out[c["target"]] = 1.0, 0.5
         if warm:
-            out[2] = min(out[2], safe[2])
+            out[c["sat"]] = np.minimum(out[c["sat"]], safe[c["sat"]])
         if cold:
-            out[5] = max(out[5], safe[5])
+            out[c["water"]] = np.maximum(out[c["water"]], safe[c["water"]])
         return out
 
     def get_action(self, obs) -> dict:
@@ -357,5 +362,5 @@ def make_mpc(name: str, meta: dict, action_spec, cache: str | None) -> MPCPolicy
         return MPCPolicy(meta, action_spec, cfg, rep["spec"], rep["rom"], exo=rep["exo"])
     from hvac_controller.d2.build import model_from_meta
 
-    spec, rom, env = model_from_meta(meta)
-    return MPCPolicy(meta, action_spec, cfg, spec, rom, model_env=env)
+    spec, rom, ctx = model_from_meta(meta)
+    return MPCPolicy(meta, action_spec, cfg, spec, rom, model_ctx=ctx)

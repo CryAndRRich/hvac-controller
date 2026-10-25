@@ -9,7 +9,8 @@ the measured zone temperatures (mpc.MPCPolicy's observer).
 
 ``model_from_meta`` writes the arrays, generates a gin config with those materials and a placeholder sinusoid weather,
 loads that environment, reads the spec and thermal core from it (d1/spec.py, d1/core.py) and builds the ROM
-(d1/rom.py). Building a ROM takes ~20 s for a 39-zone building and minutes for the largest, so it is cached per floor
+(d1/rom.py). It keeps only what ``exogenous`` needs from that environment (the schedule, the tariff and carbon
+models, h) and drops the rest: the simulator's grid and factorisation take a gigabyte or more. Building a ROM takes ~20 s for a 39-zone building and minutes for the largest, so it is cached per floor
 plan: the five weather strips of one building reuse it.
 
 ``exogenous`` builds what the model needs per step that no action changes, from the schedule alone: comfort mode and
@@ -20,10 +21,12 @@ and is overwritten online with the measured value and a forecast.
 
 from __future__ import annotations
 
+import gc as _gc
 import hashlib
 import math
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -56,7 +59,7 @@ def _key(meta: dict, materials: dict, h: float) -> str:
 
 
 def model_from_meta(meta: dict, materials: dict | None = None, h: float = H_PRIOR, log=None):
-    """(spec, rom, env) of the building the metadata describes, with the given materials and h. Cached."""
+    """(spec, rom, context) of the building the metadata describes, with the given materials and h. Cached."""
     materials = materials or prior_materials()
     key = _key(meta, materials, h)
     if key in _CACHE:
@@ -89,22 +92,27 @@ def model_from_meta(meta: dict, materials: dict | None = None, h: float = H_PRIO
     spec = BuildingSpec.from_env(env)
     env.reset()
     core = core_from_env(env)
+    rf = env.reward_function
+    context = SimpleNamespace(schedule=env.building.simulator._hvac.schedule, ec=rf._electricity_energy_cost,
+                              gc=rf._natural_gas_energy_cost, h=float(core.h) if hasattr(core, "h") else float(h))
+    del env, rf
+    _gc.collect()
     rom, info = build_rom(core, log=log)
-    _CACHE[key] = (spec, rom, env)
+    del core
+    _gc.collect()
+    _CACHE[key] = (spec, rom, context)
     return _CACHE[key]
 
 
-def exogenous(env, spec, start: pd.Timestamp, n_steps: int, occupants_per_zone: float, t_amb: float):
+def exogenous(context, spec, start: pd.Timestamp, n_steps: int, occupants_per_zone: float, t_amb: float):
     """Exogenous series (d1/spec.Exogenous) from ``start`` on, from the schedule and expectations alone."""
     from hvac_controller.d1.spec import Exogenous
     from smart_buildings.smart_control.utils import conversion_utils
 
-    hvac = env.building.simulator._hvac
-    schedule, rf = hvac.schedule, env.reward_function
-    ec, gc = rf._electricity_energy_cost, rf._natural_gas_energy_cost
+    schedule, ec, gc = context.schedule, context.ec, context.gc
     dt = pd.Timedelta(spec.dt, unit="s")
     times = [start + k * dt for k in range(n_steps + 2)]
-    comfort = np.array([float(hvac.is_comfort_mode(t)) for t in times])
+    comfort = np.array([float(schedule.is_comfort_mode(t)) for t in times])
     workday = np.array([float(conversion_utils.is_work_day(t)) for t in times])
     sod = np.array([(t.hour * 60 + t.minute) // 5 for t in times]) % 288
     present = workday * PRESENCE[sod] * occupants_per_zone  # expected occupants per zone
@@ -118,7 +126,7 @@ def exogenous(env, spec, start: pd.Timestamp, n_steps: int, occupants_per_zone: 
         max_cost[k] = ec.cost(a, b, spec.reward["max_elec"]) + gc.cost(a, b, spec.reward["max_gas"])
         max_carbon[k] = ec.carbon(a, b, spec.reward["max_elec"]) + gc.carbon(a, b, spec.reward["max_gas"])
     win = np.array([schedule.get_temperature_window(t) for t in times], dtype=float)
-    h = env.building.simulator._weather_controller.get_air_convection_coefficient(times[0])
+    h = context.h
     return Exogenous(
         t_amb=np.full(n_steps, t_amb), t_amb_next=np.full(n_steps, t_amb), h=np.full(n_steps, float(h)),
         comfort=comfort[:n_steps], win_now=win[:n_steps], win_next=win[1:n_steps + 1],
