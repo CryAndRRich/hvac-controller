@@ -89,7 +89,7 @@ hvac_controller/            # our own code, kept apart from the starter kit
 notebooks/                  # Kaggle notebooks only; each clones this repo and calls hvac_controller (datasets and order: docs/KAGGLE.md in the competition folder)
   debug.ipynb               # d1/env_check.py: MODE debug (3 scenarios x 2 days) or gate (30 x 30 days, sharded)
   data.ipynb                # replica caches: MODE all (30 shipped), gen (V2's 194 generated), fill (what cachebuildings lacks); sharded
-  train.ipynb               # GPU T4 x2: smoke checks, main + no_memory runs, the winner packaged as hvac-submission.zip
+  train.ipynb               # GPU T4 x2: smoke checks, two runs (mixed / shipped data), the winner packaged as hvac-submission.zip
   evaluate.ipynb            # a package or K10 in the original (and / or replica) on the held-out or shipped scenarios, against the reference runs
   submit.ipynb              # the submission, Internet off: the hvac-submission package in the inference server
 ```

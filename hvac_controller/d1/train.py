@@ -12,11 +12,12 @@ each bucket:
    (recomputed in the backward pass), so memory grows with seg, not h. One backward pass per bucket; gradients
    accumulate, each bucket weighted by its share of the scenarios;
 2. one actor step. Adam (0.7, 0.95), with the learning rate decaying linearly over the time budget, and the norm
-   clipped at ``clip``. On top of that, two guards against the heavy-tailed first-order gradients of steep transitions
-   (Onoda et al., ICLR 2026, §3). Per step, each row's action gradient is winsorised at ``winsor`` x the median over
-   the bucket's rows. An update whose norm exceeds ``spike`` x the median of the last 50 is skipped: V1's spikes
-   (5e4 against 0.005) passed a clip at 1.0 as steps 200 x normal and froze Adam through its second moment. The
-   actor's exponential average (``ema``) is the policy scored and kept;
+   clipped at ``clip``. An update whose norm exceeds ``spike`` x the median of the last 50 is skipped: V1's spikes
+   (5e4 against 0.005) passed a clip at 1.0 as steps 200 x normal and froze Adam through its second moment (Onoda
+   et al., ICLR 2026, §3: first-order gradients are heavy-tailed near steep transitions). ``winsor`` > 0 also caps each
+   row's action gradient per step at winsor x the median over the bucket's rows; it is off, because the off-hours
+   rows set that median, so V2's 10 capped a third of the rows on every update. The actor's exponential average
+   (``ema``) is the policy scored and kept;
 3. the critic fitted to TD(lambda) targets of the window on ``critic_rows`` fixed rows per bucket, 16 passes x 4
    shuffled minibatches, then the target critic follows it (Polyak).
 
@@ -25,7 +26,8 @@ next 24 hours.
 
 Scored in the replica every ``eval_minutes`` on the held-out scenarios (``--val-caches``), every scenario from its
 initial state for the whole episode. The training scenarios are scored at the end. The best average, of the
-held-out scenarios when there are any, is kept: ``d1_policy.pt``, the file policy.KagglePolicy loads. Other guards:
+held-out scenarios when there are any (those whose label starts with ``select`` when it is set), is kept:
+``d1_policy.pt``, the file policy.KagglePolicy loads. Other guards:
 - a non-finite gradient skips the step and halves the learning rate (three in a row stop the run), and the rows
   restart;
 - five skipped spikes in a row, a held-out score 15 % worse than the best on two evaluations in a row, or a moving
@@ -75,14 +77,14 @@ class Config:
     h: int = 288
     gamma: float = 0.998
     lam: float = 0.95
-    seg: int = 12  # checkpointed segment of the window
-    row_budget: int = 1_435_000  # rows x seg x (padded) VAVs per bucket: ~8 GB on a T4 (2.87M ran out at 14.4 GB)
+    seg: int = 4  # checkpointed segment of the window: activation memory grows with rows x seg x VAVs
+    row_budget: int = 717_500  # rows x seg x (padded) VAVs per bucket: 13.1 GB peak on a T4 (V2, seg 12)
     buckets: int = 3
     minutes: float = 30.0  # training time budget
     lr_actor: float = 2e-3
     lr_critic: float = 5e-4
     clip: float = 1.0
-    winsor: float = 10.0  # per-step cap of a row's action gradient, x the median over rows (0: off)
+    winsor: float = 0.0  # per-step cap of a row's action gradient, x the median over rows (0: off)
     spike: float = 10.0  # skip an update whose gradient norm exceeds this x the median of the last 50 (0: off)
     ema: float = 0.98  # decay of the actor's average, the policy scored and kept
     critic_iters: int = 16
@@ -94,6 +96,7 @@ class Config:
     eval_minutes: float = 20.0
     eval_seeds: int = 1
     eval_steps: int = 0  # 0: the whole episode
+    select: str = ""  # held-out scenarios whose label starts with this choose the kept policy ("": all)
     width: int = 64
     seed: int = 0
 
@@ -446,13 +449,17 @@ class Trainer:
         self.log(f"[train] it {self.iteration}: {why}: networks restored to the best, lr scale {self.lr_scale}")
 
     # ---- the loop ---------------------------------------------------------------------------------------------
-    def train(self) -> dict:
+    def train(self, checks=None) -> dict:
+        """The run; ``checks(trainer) -> dict`` (the smoke's) goes into the report after the burn-in."""
         cfg, out, log = self.cfg, self.out, self.log
         report = {"setup": {}, "evals": []}
         t0 = time.time()
         for b in self.buckets:
             self.burn_in(b)
         report["setup"]["burn_in_s"] = time.time() - t0
+        log(f"[train] burn-in {report['setup']['burn_in_s']:.0f}s, {_allocated_gb():.1f} GB allocated")
+        if checks is not None:
+            report.update(checks(self))
         budget = cfg.minutes * 60.0
         t_start, t_ckpt, t_eval = time.time(), time.time(), time.time()
         bad, spikes, ema, best_ema, snap, cooldown, rollbacks = 0, 0, None, -math.inf, None, 0, 0
@@ -559,11 +566,12 @@ class Trainer:
         except Exception as e:  # a failed evaluation must not end the training
             self.log(f"[eval] failed: {type(e).__name__}: {e}")
             return
-        ev.update(it=self.iteration, min=elapsed / 60.0, held_out=bool(self.val))
+        key = float(np.mean([v["score"] for k, v in ev.items()
+                             if isinstance(v, dict) and k.startswith(self.cfg.select)]))
+        ev.update(it=self.iteration, min=elapsed / 60.0, held_out=bool(self.val), key=key)
         report["evals"].append(ev)
         with open(self.out / "eval_log.jsonl", "a") as f:
             f.write(json.dumps(ev) + "\n")
-        key = ev["mean"]
         if key < self.best:
             self.best, self.bad_evals = key, 0
             self.best_snap = self._snapshot()
@@ -575,7 +583,8 @@ class Trainer:
                 self.bad_evals = 0
         per = " ".join(f"{k}:{v['score']:.5f}" for k, v in ev.items() if isinstance(v, dict))
         what = "held-out" if self.val else "train"
-        self.log(f"[eval] it {self.iteration} {elapsed / 60.0:.1f} min: {what} {key:.5f} (best {self.best:.5f}) | {per}")
+        self.log(f"[eval] it {self.iteration} {elapsed / 60.0:.1f} min: {what} {key:.5f} (best {self.best:.5f}; all "
+                 f"{ev['mean']:.5f}) | {per}")
 
 
 # ---- start-up checks -------------------------------------------------------------------------------------------
@@ -637,26 +646,56 @@ def group_check(reps: list[dict], device: str, n_steps: int = 288) -> dict:
     return {"steps": n_steps, "reward_rel_max": worst, "ok": worst < 1e-4}
 
 
-def checkpoint_check(trainer: Trainer, b: Bucket) -> dict:
-    """Gradients of one window with checkpointed segments against the plain backward pass (seg = h)."""
-    params = list(trainer.ctrl.parameters())
+def _allocated_gb() -> float:
+    return torch.cuda.memory_allocated() / 2 ** 30 if torch.cuda.is_available() else 0.0
+
+
+def _window_grad(trainer: Trainer, b: Bucket, **settings) -> tuple[torch.Tensor, float]:
+    """The actor gradient (flattened) of one window from b.start with some settings changed, and the window's peak
+    memory above what was allocated before it, GB; the settings, b.start and the gradients are left as they were."""
+    cfg, params = trainer.cfg, list(trainer.ctrl.parameters())
     start = {"state": dict(b.start["state"]), "obs": b.start["obs"], "mem": b.start["mem"], "k": b.start["k"]}
-    grads = []
-    seg = trainer.cfg.seg
-    for s in (seg, trainer.cfg.h):
-        trainer.cfg.seg = s
-        b.start = start
-        trainer.opt_a.zero_grad(set_to_none=False)
-        trainer.window(b, 1.0)
-        grads.append([p.grad.clone() for p in params])
-    trainer.cfg.seg = seg
+    keep = {k: getattr(cfg, k) for k in settings}
+    for k, v in settings.items():
+        setattr(cfg, k, v)
+    trainer.opt_a.zero_grad(set_to_none=True)
+    cuda = torch.cuda.is_available()
+    if cuda:
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+    base = _allocated_gb()
+    trainer.window(b, 1.0)
+    peak = torch.cuda.max_memory_allocated() / 2 ** 30 - base if cuda else 0.0
+    g = torch.cat([(p.grad if p.grad is not None else torch.zeros_like(p)).flatten() for p in params])
+    for k, v in keep.items():
+        setattr(cfg, k, v)
     b.start = start
-    trainer.opt_a.zero_grad(set_to_none=False)
-    diff = torch.sqrt(sum(((x - y) ** 2).sum() for x, y in zip(*grads)))
-    ref = torch.sqrt(sum((y ** 2).sum() for y in grads[1]))
-    err = float(diff / ref.clamp(min=1e-30))
-    finite = all(bool(torch.isfinite(g).all()) for g in grads[0])
-    return {"grad_rel_err": err, "finite": finite, "ok": finite and err < 1e-4}
+    trainer.opt_a.zero_grad(set_to_none=True)
+    return g, peak
+
+
+def checkpoint_check(trainer: Trainer, b: Bucket) -> dict:
+    """Gradients of one window with checkpointed segments against the plain backward pass (seg = h), and the peak
+    memory of each: with checkpointing it should shrink about as seg / h."""
+    seg, h = trainer.cfg.seg, trainer.cfg.h
+    (g, m_seg), (ref, m_h) = _window_grad(trainer, b, seg=seg), _window_grad(trainer, b, seg=h)
+    err = float((g - ref).norm() / ref.norm().clamp(min=1e-30))
+    finite = bool(torch.isfinite(g).all())
+    return {"grad_rel_err": err, "finite": finite, "ok": finite and err < 1e-4, "rows": b.rows, "V": b.V,
+            "peak_gb": {f"seg {seg}": m_seg, f"seg {h}": m_h}}
+
+
+def winsor_check(trainer: Trainer, b: Bucket, k: float = 10.0) -> dict:
+    """A training bucket's window gradient with the action gradients winsorised at k x the median row norm, against
+    the plain one: the share of rows capped and the two gradients' cosine. Also the plain window's peak memory, GB."""
+    trainer.wstats.zero_()
+    g_w, _ = _window_grad(trainer, b, winsor=k)
+    capped = float(trainer.wstats[0] / trainer.wstats[1].clamp(min=1.0))
+    trainer.wstats.zero_()
+    g, peak = _window_grad(trainer, b, winsor=0.0)
+    cos = float(torch.dot(g_w, g) / (g_w.norm() * g.norm()).clamp(min=1e-30))
+    return {"V": b.V, "rows": b.rows, "capped": capped, "cosine": cos, "norm_ratio": float(g_w.norm() / g.norm()),
+            "peak_gb": peak}
 
 
 def load_buckets(caches: list[Path], n_buckets: int, row_budget: int, seg: int, device: str,
@@ -673,6 +712,13 @@ def load_buckets(caches: list[Path], n_buckets: int, row_budget: int, seg: int, 
     order = sorted(groups, key=lambda k: (groups[k][0]["spec"].n_vavs, k))
     parts = [list(p) for p in np.array_split(np.array(order, dtype=object), min(n_buckets, len(order))) if len(p)]
     return [Bucket([r for k in part for r in groups[k]], row_budget, seg, device, rows_per) for part in parts]
+
+
+def smoke_checks(trainer: Trainer) -> dict:
+    """After the burn-in: winsor_check on every training bucket (informative, not a gate)."""
+    out = {"winsor": [winsor_check(trainer, b) for b in trainer.buckets]}
+    trainer.log(f"[smoke] winsorised at 10 x median vs plain, per bucket: {out['winsor']}")
+    return out
 
 
 def main() -> None:
@@ -702,6 +748,9 @@ def main() -> None:
     try:
         buckets = load_buckets(caches, cfg.buckets, cfg.row_budget, cfg.seg, device)
         val = load_buckets(val_caches, 1, 0, cfg.seg, device, rows_per=1)
+        scored = [l for b in (val or buckets) for l in b.labels]
+        if not any(l.startswith(cfg.select) for l in scored):
+            raise SystemExit(f"[train] --select {cfg.select!r} matches none of the scored scenarios")
         trainer = Trainer(cfg, buckets, val, device, out, log)
         if a.resume:
             trainer.load(a.resume)
@@ -709,7 +758,7 @@ def main() -> None:
             f"{b.S} scenarios of {len({l.split('__')[0] for l in b.labels})} buildings, V <= {b.V}, rows {b.rows} "
             f"({b.rows // b.S} per scenario), sweeps {b.env.rom.sweeps}" for b in buckets)
             + f" | {sum(b.S for b in val)} held-out scenarios | row budget {cfg.row_budget} "
-              f"| setup {time.time() - t0:.0f}s")
+              f"| setup {time.time() - t0:.0f}s, {_allocated_gb():.1f} GB allocated")
         if a.smoke:
             reps = [r for b in buckets + val for r in b.reps]
             first = next(r for r in reps if Path(r["info"]["config"]).exists())  # the original simulator runs it
@@ -726,7 +775,7 @@ def main() -> None:
             del small, reps, first, other
             if not (report["parity"]["ok"] and report["group"]["ok"] and report["checkpoint"]["ok"]):
                 raise SystemExit("[smoke] a start-up check failed")
-        report.update(trainer.train())
+        report.update(trainer.train(smoke_checks if a.smoke else None))
     except torch.cuda.OutOfMemoryError as e:
         where = [f for f in traceback.extract_tb(e.__traceback__) if "hvac_controller" in f.filename][-1]
         log(f"[train] out of memory in {where.name} ({where.filename.split('/')[-1]}:{where.lineno}), "
