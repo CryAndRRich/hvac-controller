@@ -16,7 +16,7 @@ no simulator object, no building or weather identity). ``Controller`` holds the 
   pump differential pressure and pump run command. Priors (as K10): AHUs and pump on while the comfort mode is on
   or due within the hour, supply 288 K, static pressure ~285 Pa, recirculation ~0.67. The run commands stay on in
   those hours; the network can only add running time outside them (pre-heating, pre-cooling). The pilot
-  (2026-10-20) let it switch units off in occupied hours too: after ~50 updates the straight-through
+  (notebook 21, 2026-10-20) let it switch units off in occupied hours too: after ~50 updates the straight-through
   gradient (always "a little less air saves energy") flipped them off, comfort collapsed and the saturated sigmoid
   never switched them back;
 - a differentiable PI loop per VAV towards its target (K10's law with tanh in place of the clip): damper
@@ -27,14 +27,6 @@ no simulator object, no building or weather identity). ``Controller`` holds the 
 - run commands: 0 / 1 in the forward pass, the sigmoid's gradient in the backward pass (straight-through). The
   replica's relaxed plant fed 0 / 1 computes exactly what the exact plant does, so training and scoring run the same
   forward pass.
-
-- memory (``memory=True``): exponential averages of the outside temperature (1 h, 6 h, 24 h) and of each zone's
-  temperature (1 h, 6 h), carried with the PI integrals; the first step of an episode sets them to the observed
-  values. They let the policy see the weather's trend and each zone's drift, which one observation does not hold.
-
-Layouts are per row: one building's (``Layout.tensors``, leading dimension 1) or a padded batch of several
-buildings' (``stack_layouts``: VAVs, AHUs and action columns padded to the largest, with masks), so one batch can
-mix buildings of different sizes.
 
 ``KagglePolicy`` is the gateway's ``Policy(building_meta_data, action_spec)`` around it.
 """
@@ -53,8 +45,6 @@ GLOBAL_FIELDS = ("hod_sin_000", "hod_cos_000", "dow_sin_000", "dow_cos_000", "co
                  "num_occupants")
 N_GLOBAL = len(GLOBAL_FIELDS) + 2  # + outside and tank temperature
 N_VAV = 6
-TAU_OUT, TAU_ZONE = (3600.0, 21600.0, 86400.0), (3600.0, 21600.0)  # memory time constants, seconds
-DT = 300.0
 # Continuous commands in the order the controller produces them: per AHU (A each), plant, per VAV (V each).
 CONT_GROUPS = ("ahu_sp", "ahu_p", "ahu_r", "w_sp", "w_dp", "damper", "valve")
 
@@ -157,67 +147,21 @@ class Layout:
             if tuple(spec.disc[c][:2]) != want:
                 raise AssertionError(f"discrete column {c}: layout {want}, environment {tuple(spec.disc[c][:2])}")
 
-    def padded(self, V: int, A: int, n_cont: int, n_disc: int) -> dict:
-        """NumPy arrays of this building padded to V VAVs, A AHUs and the given action widths.
-
-        The controller's native command vector is [supply temperature (A) | pressure (A) | recirculation (A) | water
-        setpoint, pump pressure (2) | damper (V) | valve (V)]; inv_cont maps each action column to its entry there,
-        inv_disc each discrete column to [AHU run (A) | pump run (1)]; padded columns are masked to 0."""
-        v, a = self.V, self.A
-        off = {"ahu_sp": 0, "ahu_p": A, "ahu_r": 2 * A, "w_sp": 3 * A, "w_dp": 3 * A + 1, "damper": 3 * A + 2,
-               "valve": 3 * A + 2 + V}
-        n_nat = 3 * A + 2 + 2 * V
-        lo, hi, nlo, nhi = np.zeros(n_nat), np.ones(n_nat), -np.ones(n_nat), np.ones(n_nat)
-        inv, c_mask = np.zeros(n_cont, dtype=np.int64), np.zeros(n_cont)
-        for k, (c, (g, j)) in enumerate(zip(self.cont_cols, self.cont_targets)):
-            pos = off[g] + j
-            lo[pos], hi[pos], nlo[pos], nhi[pos] = self.cont_ranges[k]
-            inv[c], c_mask[c] = pos, 1.0
-        inv_d, d_mask = np.zeros(n_disc, dtype=np.int64), np.zeros(n_disc)
-        for i, c in enumerate(self.disc_cols):
-            inv_d[c], d_mask[c] = (i if i < a else A), 1.0
-        pool, onehot = np.zeros((A, V)), np.zeros((V, A))
-        pool[self.vav_ahu, np.arange(v)] = 1.0
-        pool /= np.maximum(pool.sum(1, keepdims=True), 1.0)
-        onehot[np.arange(v), self.vav_ahu] = 1.0
-
-        def pad(x, n, fill):
-            x = np.asarray(x)
-            return np.concatenate([x, np.repeat(np.asarray(fill, dtype=x.dtype)[None], n - len(x), 0)]) if n > len(x) else x
-
-        unit = np.array([0.0, 1.0])
-        return {"i_temp": pad(self.i_temp, V, 0), "i_heat": pad(self.i_heat, V, 0), "i_cool": pad(self.i_cool, V, 0),
-                "c_temp": pad(self.c_temp, V, unit), "c_heat": pad(self.c_heat, V, unit),
-                "c_cool": pad(self.c_cool, V, unit), "i_glob": np.asarray(self.i_glob), "i_temps": np.asarray(self.i_temps),
-                "c_temps": self.c_temps, "pool": pool, "onehot": onehot, "v_mask": pad(np.ones(v), V, 0.0),
-                "a_mask": pad(np.ones(a), A, 0.0), "inv_cont": inv, "c_mask": c_mask, "inv_disc": inv_d,
-                "d_mask": d_mask, "native_lo": lo, "native_hi": hi, "norm_lo": nlo, "norm_hi": nhi}
-
     def tensors(self, device) -> dict:
-        """This building's layout for a batch of its rows (leading dimension 1)."""
-        return _to_tensors([self.padded(self.V, self.A, self.n_cont, self.n_disc)], np.zeros(1, dtype=np.int64),
-                           self.V, self.A, device)
-
-
-def stack_layouts(layouts: list[Layout], row_s, device) -> dict:
-    """A padded per-row layout for a batch mixing buildings: row i has layouts[row_s[i]]."""
-    V, A = max(l.V for l in layouts), max(l.A for l in layouts)
-    n_cont, n_disc = max(l.n_cont for l in layouts), max(l.n_disc for l in layouts)
-    return _to_tensors([l.padded(V, A, n_cont, n_disc) for l in layouts], np.asarray(row_s), V, A, device)
-
-
-def _to_tensors(pads: list[dict], row_s, V: int, A: int, device) -> dict:
-    out = {"V": V, "A": A}
-    for k in pads[0]:
-        v = np.stack([p[k] for p in pads])[row_s]
-        dt = torch.long if v.dtype.kind in "iu" else torch.float32
-        out[k] = torch.as_tensor(v, dtype=dt, device=device)
-    return out
-
-
-def _take(x, idx):
-    """x (B, n) at columns idx (1 or B, k)."""
-    return torch.gather(x, 1, idx.expand(x.shape[0], -1))
+        t = (lambda x, dt=torch.float32: torch.as_tensor(np.asarray(x), dtype=dt, device=device))
+        V, A = self.V, self.A
+        pool = np.zeros((A, V))
+        pool[self.vav_ahu, np.arange(V)] = 1.0
+        pool /= np.maximum(pool.sum(1, keepdims=True), 1.0)
+        inv = np.argsort(self.cont_cols)
+        inv_d = np.argsort(self.disc_cols)
+        r = self.cont_ranges
+        return {"V": V, "A": A, "i_temp": t(self.i_temp, torch.long), "i_heat": t(self.i_heat, torch.long),
+                "i_cool": t(self.i_cool, torch.long), "i_glob": t(self.i_glob, torch.long),
+                "i_temps": t(self.i_temps, torch.long), "c_temp": t(self.c_temp), "c_heat": t(self.c_heat),
+                "c_cool": t(self.c_cool), "c_temps": t(self.c_temps), "vav_ahu": t(self.vav_ahu, torch.long),
+                "pool": t(pool), "inv_cont": t(inv, torch.long), "inv_disc": t(inv_d, torch.long),
+                "native_lo": t(r[:, 0]), "native_hi": t(r[:, 1]), "norm_lo": t(r[:, 2]), "norm_hi": t(r[:, 3])}
 
 
 def _mlp(n_in: int, width: int, n_out: int | None = None) -> nn.Sequential:
@@ -238,18 +182,16 @@ def _hard(p):
 
 class Controller(nn.Module):
     def __init__(self, width: int = 64, p_floor: float = 200.0, max_recirc: float = 0.7, min_damper: float = 0.1,
-                 kp: float = 0.1, ki: float = 0.005, memory: bool = True):
+                 kp: float = 0.1, ki: float = 0.005):
         super().__init__()
         self.config = {"width": width, "p_floor": p_floor, "max_recirc": max_recirc, "min_damper": min_damper,
-                       "kp": kp, "ki": ki, "memory": memory}
-        self.p_floor, self.max_recirc, self.min_damper, self.memory = p_floor, max_recirc, min_damper, memory
+                       "kp": kp, "ki": ki}
+        self.p_floor, self.max_recirc, self.min_damper = p_floor, max_recirc, min_damper
         self.i_max = 1.0 / ki
-        self.n_vav = N_VAV + (len(TAU_ZONE) if memory else 0)
-        self.n_glob = N_GLOBAL + (len(TAU_OUT) if memory else 0)
-        n_v = self.n_vav + self.n_glob
+        n_v = N_VAV + N_GLOBAL
         self.enc_v = _mlp(n_v, width)
-        self.enc_a = _mlp(width + self.n_glob, width)
-        self.enc_g = _mlp(width + self.n_glob, width)
+        self.enc_a = _mlp(width + N_GLOBAL, width)
+        self.enc_g = _mlp(width + N_GLOBAL, width)
         self.dec_v = _mlp(3 * width, width, 3)
         self.dec_a = _mlp(2 * width, width, 4)
         self.dec_p = _mlp(width, width, 3)
@@ -259,64 +201,32 @@ class Controller(nn.Module):
         # ~285 Pa, recirculation ~0.67); plant (water 330 K, pump dp near its maximum, pump run as the AHUs).
         self.register_buffer("ahu_bias", torch.tensor([0.0, math.log(3.0 / 17.0), -3.0, 3.0]))
         self.register_buffer("plant_bias", torch.tensor([0.0, 3.0, 0.0]))
-        self.register_buffer("alpha_out", torch.tensor([1.0 - math.exp(-DT / t) for t in TAU_OUT]))
-        self.register_buffer("alpha_zone", torch.tensor([1.0 - math.exp(-DT / t) for t in TAU_ZONE]))
 
-    @staticmethod
-    def init_mem(rows: int, lay: dict, device=None) -> tuple:
-        """Episode-start memory: PI integrals (B, V), zone averages (B, V, 2), outside averages and step count (B, 4)."""
-        V = lay["V"]
-        return (torch.zeros(rows, V, device=device), torch.zeros(rows, V, len(TAU_ZONE), device=device),
-                torch.zeros(rows, len(TAU_OUT) + 1, device=device))
-
-    @staticmethod
-    def reset_mem(mem: tuple, done) -> tuple:
-        """Rows whose episode ended back to the episode-start memory."""
-        return tuple(torch.where(done.view(-1, *([1] * (m.dim() - 1))), torch.zeros_like(m), m) for m in mem)
-
-    def _decode(self, obs, lay: dict):
+    def features(self, obs, I, lay: dict):
+        """Decoded per-VAV (B, V, N_VAV) and global (B, N_GLOBAL) features, kelvin temperatures and the band."""
         def dec(idx, c):
-            return _take(obs, idx) * c[..., 1] + c[..., 0]
+            return obs[:, idx] * c[:, 1] + c[:, 0]
 
         T, lo, hi = dec(lay["i_temp"], lay["c_temp"]), dec(lay["i_heat"], lay["c_heat"]), dec(lay["i_cool"], lay["c_cool"])
-        return T, lo, hi, _take(obs, lay["i_glob"]), dec(lay["i_temps"], lay["c_temps"])
+        g = obs[:, lay["i_glob"]]
+        temps = dec(lay["i_temps"], lay["c_temps"])
+        glob = torch.cat([g[:, :6], torch.log1p(g[:, 6:7].clamp(min=0.0)) / 5.0, (temps[:, :1] - 295.0) / 10.0,
+                          (temps[:, 1:] - 330.0) / 20.0], 1)
+        vav = torch.stack([(T - 295.0) / 5.0, (lo - 295.0) / 5.0, (hi - 295.0) / 5.0, (T - lo) / 2.0, (T - hi) / 2.0,
+                           I * self.config["ki"]], 2)
+        return vav, glob, T, lo, hi
 
-    def _remember(self, mem: tuple, T, t_out) -> tuple:
-        """Memory after seeing this step's zone and outside temperatures (the first step of an episode sets it)."""
-        I, m_v, m_g = mem
-        n = m_g[:, -1:]
-        a_out = torch.maximum(self.alpha_out, 1.0 / (n + 1.0))
-        a_zone = torch.maximum(self.alpha_zone, 1.0 / (n[:, :, None] + 1.0))
-        m_out = m_g[:, :-1] + a_out * (t_out - m_g[:, :-1])
-        m_v = m_v + a_zone * (T[..., None] - m_v)
-        return I, m_v, torch.cat([m_out, n + 1.0], 1)
-
-    def features(self, obs, mem: tuple, lay: dict):
-        """Decoded per-VAV (B, V, n_vav) and global (B, n_glob) features, kelvin temperatures, the band and the
-        memory updated with this observation."""
-        T, lo, hi, g, temps = self._decode(obs, lay)
-        mem = self._remember(mem, T, temps[:, :1])
-        I, m_v, m_g = mem
-        glob = [g[:, :6], torch.log1p(g[:, 6:7].clamp(min=0.0)) / 5.0, (temps[:, :1] - 295.0) / 10.0,
-                (temps[:, 1:] - 330.0) / 20.0]
-        vav = [(T - 295.0) / 5.0, (lo - 295.0) / 5.0, (hi - 295.0) / 5.0, (T - lo) / 2.0, (T - hi) / 2.0,
-               I * self.config["ki"]]
-        if self.memory:
-            glob.append((m_g[:, :-1] - 295.0) / 10.0)
-            vav += [(m_v[..., j] - T) / 2.0 for j in range(m_v.shape[2])]
-        return torch.stack(vav, 2), torch.cat(glob, 1), T, lo, hi, mem
-
-    def act(self, obs, mem: tuple, lay: dict):
-        """obs (B, n_obs), memory -> continuous (B, n_cont) and discrete (B, n_disc) actions, memory'."""
+    def act(self, obs, I, lay: dict):
+        """obs (B, n_obs), integral I (B, V) -> continuous (B, n_cont) and discrete (B, n_disc) actions, I'."""
         V, A = lay["V"], lay["A"]
-        vav, glob, T, lo, hi, (I, m_v, m_g) = self.features(obs, mem, lay)
+        vav, glob, T, lo, hi = self.features(obs, I, lay)
         B = obs.shape[0]
         gv = glob[:, None, :].expand(B, V, glob.shape[1])
         h_v = self.enc_v(torch.cat([vav, gv], 2))
-        h_a = self.enc_a(torch.cat([torch.matmul(lay["pool"], h_v), glob[:, None, :].expand(B, A, glob.shape[1])], 2))
-        a_mask = lay["a_mask"][..., None]
-        h_g = self.enc_g(torch.cat([(h_a * a_mask).sum(1) / a_mask.sum(1), glob], 1))
-        z_v = self.dec_v(torch.cat([h_v, torch.matmul(lay["onehot"], h_a), h_g[:, None, :].expand(B, V, h_g.shape[1])], 2))
+        h_a = self.enc_a(torch.cat([torch.einsum("av,bvw->baw", lay["pool"], h_v),
+                                    glob[:, None, :].expand(B, A, glob.shape[1])], 2))
+        h_g = self.enc_g(torch.cat([h_a.mean(1), glob], 1))
+        z_v = self.dec_v(torch.cat([h_v, h_a[:, lay["vav_ahu"]], h_g[:, None, :].expand(B, V, h_g.shape[1])], 2))
         z_a = self.dec_a(torch.cat([h_a, h_g[:, None, :].expand(B, A, h_g.shape[1])], 2)) + self.ahu_bias
         z_p = self.dec_p(h_g) + self.plant_bias
         active = torch.maximum(glob[:, 4:5], glob[:, 5:6])  # comfort mode now or within the hour
@@ -334,15 +244,17 @@ class Controller(nn.Module):
         idle = 1.0 - active  # the network's run logits act only outside the comfort hours
         run_a = _hard(torch.sigmoid(6.0 * active - 3.0 + idle * z_a[..., 0]))
         pump = _hard(torch.sigmoid(6.0 * active - 3.0 + idle * z_p[:, 2:3]))
-        sp = lo_n[:, :A] + (hi_n[:, :A] - lo_n[:, :A]) * s_a[..., 1]
-        p = self.p_floor + (hi_n[:, A:2 * A] - self.p_floor) * s_a[..., 2]
-        r = lo_n[:, 2 * A:3 * A] + (self.max_recirc - lo_n[:, 2 * A:3 * A]) * s_a[..., 3]
-        w = lo_n[:, 3 * A:3 * A + 2] + (hi_n[:, 3 * A:3 * A + 2] - lo_n[:, 3 * A:3 * A + 2]) * s_p[:, :2]
+        sp = lo_n[:A] + (hi_n[:A] - lo_n[:A]) * s_a[..., 1]
+        p = self.p_floor + (hi_n[A:2 * A] - self.p_floor) * s_a[..., 2]
+        r = lo_n[2 * A:3 * A] + (self.max_recirc - lo_n[2 * A:3 * A]) * s_a[..., 3]
+        w = lo_n[3 * A:3 * A + 2] + (hi_n[3 * A:3 * A + 2] - lo_n[3 * A:3 * A + 2]) * s_p[:, :2]
         native = torch.cat([sp, p, r, w, damper, valve], 1)
         a = (native - lo_n) / (hi_n - lo_n) * (lay["norm_hi"] - lay["norm_lo"]) + lay["norm_lo"]
-        a_c = _take(a, lay["inv_cont"]) * lay["c_mask"]
-        a_d = _take(torch.cat([run_a, pump], 1), lay["inv_disc"]) * lay["d_mask"]
-        return a_c, a_d, (I, m_v, m_g)
+        return a[:, lay["inv_cont"]], torch.cat([run_a, pump], 1)[:, lay["inv_disc"]], I
+
+
+def find_weights(root: Path = Path("/kaggle/input"), name: str = "d1_policy.pt") -> Path:
+    return next(iter(sorted(root.rglob(name))))
 
 
 def save_policy(ctrl: Controller, path: Path) -> None:
@@ -359,14 +271,14 @@ def load_policy(path: Path, device="cpu") -> Controller:
 class KagglePolicy:
     """The gateway's policy: one building, one observation per call, CPU."""
 
-    def __init__(self, building_meta_data, action_spec, weights: Path):
-        self.ctrl = load_policy(weights)
+    def __init__(self, building_meta_data, action_spec, weights: Path | None = None):
+        self.ctrl = load_policy(weights or find_weights())
         self.lay = Layout(building_meta_data).tensors("cpu")
-        self.mem = Controller.init_mem(1, self.lay)
+        self.I = torch.zeros(1, self.lay["V"])
 
     def get_action(self, obs):
         with torch.no_grad():
-            a_c, a_d, self.mem = self.ctrl.act(torch.as_tensor(np.asarray(obs), dtype=torch.float32)[None], self.mem,
-                                               self.lay)
+            a_c, a_d, self.I = self.ctrl.act(torch.as_tensor(np.asarray(obs), dtype=torch.float32)[None], self.I,
+                                             self.lay)
         return {"continuous_action": np.clip(a_c[0].numpy(), -1.0, 1.0).astype(np.float32),
                 "discrete_action": a_d[0].numpy().round().astype(np.int32)}

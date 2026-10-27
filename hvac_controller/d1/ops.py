@@ -116,12 +116,6 @@ class Ops:
     def sum(self, x, axis):
         return x.sum(dim=axis) if self.is_torch else x.sum(axis=axis)
 
-    def take(self, x, idx):
-        """x (B, n) at per-row columns idx (B, k) -> (B, k)."""
-        if self.is_torch:
-            return self.torch.take_along_dim(x, idx, dim=1)
-        return np.take_along_axis(x, idx, axis=1)
-
     def concatenate(self, xs, axis):
         return self.torch.cat(xs, dim=axis) if self.is_torch else np.concatenate(xs, axis=axis)
 

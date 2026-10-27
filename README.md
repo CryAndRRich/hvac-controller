@@ -78,18 +78,18 @@ hvac_controller/            # our own code, kept apart from the starter kit
   d1/ops.py                 # step C: one array namespace for NumPy and PyTorch
   d1/spec.py                # step C: static building spec + exogenous series, read from the organisers' env
   d1/plant.py               # step C: equipment, reward and observation as pure batched functions
-  d1/torch_env.py           # BuildingEnv = ROM + plant, batched (rows with their own time; scenarios of one or several buildings, padded), NumPy or PyTorch; resized() shares its tensors
+  d1/torch_env.py           # BuildingEnv = ROM + plant, batched (rows with their own time; scenarios of one building), NumPy or PyTorch
   d1/trace.py               # step C: ground-truth tracer for the organisers' env; structured random policy
   d1/env_check.py           # replica vs original, tiers T0-T5: the regression check for any change to the replica
   d1/cache.py               # step 6: one scenario's replica inputs (spec, ROM, exogenous, metadata), pickled once
   d1/evaluate.py            # step 6: score policies in the original and the replica over noise ensembles (null groups)
   d1/policy.py              # step 6: size-agnostic supervisory policy (+ differentiable PI, weather/zone memory); KagglePolicy for submission
-  d1/train.py               # SHAC through the replica (size buckets, checkpointed windows, spike guards, EMA, replica scoring)
-  d1/augment.py             # V2: generated buildings + TMYx strips by climate (manifest, buildings, presets, scenarios)
+  d1/train.py               # SHAC through the replica (V1's trainer + relative clip + buildings sampled per update; replica scoring)
+  d1/augment.py             # generated buildings from the shipped ones' ranges + TMYx strips by climate (manifest, buildings, presets, scenarios)
 notebooks/                  # Kaggle notebooks only; each clones this repo and calls hvac_controller (datasets and order: docs/KAGGLE.md in the competition folder)
   debug.ipynb               # d1/env_check.py: MODE debug (3 scenarios x 2 days) or gate (30 x 30 days, sharded)
-  data.ipynb                # replica caches: MODE all (30 shipped), gen (V2's 194 generated), fill (what cachebuildings lacks); sharded
-  train.ipynb               # GPU T4 x2: smoke checks, two runs (mixed / shipped data), the winner packaged as hvac-submission.zip
+  data.ipynb                # replica caches: MODE all (30 shipped), gen (86 generated); sharded
+  train.ipynb               # GPU T4 x2: smoke checks, two runs (clip / clip + generated data), the winner packaged as hvac-submission.zip
   evaluate.ipynb            # a package or K10 in the original (and / or replica) on the held-out or shipped scenarios, against the reference runs
   submit.ipynb              # the submission, Internet off: the hvac-submission package in the inference server
 ```
