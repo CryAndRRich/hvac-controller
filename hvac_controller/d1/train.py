@@ -21,6 +21,12 @@ up to 5.7e4), so the absolute clip let a spike through as a step about 200 x nor
 Adam for the rest of the run; Adam needs a clip at the scale of the typical gradient under heavy-tailed noise
 (Chezhegov et al., ICML 2025), and a threshold relative to recent norms keeps it there as that scale drifts (as
 SPAM, ICLR 2025, and ZClip, 2025, do for language models). Spikes are clipped, not skipped: the step still counts.
+The clip also holds per window: each building's part of the gradient (the gradient after its backward pass minus
+before) is clipped to the limit x its weight, so no building takes more than its share of a step, and dropped when it
+or the window's loss is non-finite or its norm exceeds ``drop_rel`` x that cap. Over 288 steps the backward pass
+through a closed loop near a limit cycle grows exponentially: V2.2's runs reached 1e9 to inf in some windows, three
+updates in a row, while the other buildings' windows were normal, and the guard that skipped those steps, halved the
+learning rate and stopped the run after three ended both runs at 42 and 77 of 300 minutes.
 
 The critic is a DeepSets over VAVs with privileged global inputs: the outside temperature and comfort flags of the
 next 24 hours.
@@ -29,12 +35,12 @@ Scored in the replica every ``eval_minutes``: every scenario from its initial st
 plain and seeds >= 1 with observation noise of evaluate.SIGMA, on the held-out scenarios whose label starts with
 ``select`` (``--val-caches``; all held-out ones when empty, the training ones when there are none). The best policy
 by their mean is kept (``d1_policy.pt``, the file policy.KagglePolicy loads); at the end it is scored on every
-held-out scenario. Guards: a non-finite or huge gradient skips the step and halves the learning rate (three in a row
-stop the run), the rows move on, and those with non-finite states restart; a collapse (the mean over buildings of the
-moving average of each one's training reward 50 % worse than its best) restores the networks and optimisers saved at
-that best and halves the learning rate; the time budget ends the run cleanly, ``last.pt`` is written every 15
-minutes and ``--resume`` continues from it; out of GPU memory, the process restarts itself with half the row budget,
-from ``last.pt`` when there is one.
+held-out scenario. Guards: a window's non-finite or exploding gradient is dropped (above), and when every window of
+an iteration is dropped no step is taken; rows move on, and those with non-finite states restart; a collapse (the
+mean over buildings of the moving average of each one's training reward 50 % worse than its best) restores the
+networks and optimisers saved at that best and halves the learning rate; the time budget ends the run cleanly,
+``last.pt`` is written every 15 minutes and ``--resume`` continues from it; out of GPU memory, the process restarts
+itself with half the row budget, from ``last.pt`` when there is one.
 """
 
 from __future__ import annotations
@@ -79,6 +85,7 @@ class Config:
     clip: float = 1.0
     clip_rel: float = 0.0  # > 0: clip at min(clip, clip_rel x median of the last clip_window pre-clip norms)
     clip_window: int = 50
+    drop_rel: float = 100.0  # a window's gradient above drop_rel x its cap is dropped
     per_update: int = 0  # buildings per iteration, drawn at random; 0: all
     select: str = ""  # held-out labels starting with this choose the kept policy
     critic_iters: int = 16
@@ -172,7 +179,10 @@ class Trainer:
         self.target = Critic(cfg.width).to(device)
         self.target.load_state_dict(self.critic.state_dict())
         self.target.requires_grad_(False)
-        self.opt_a = torch.optim.Adam(self.ctrl.parameters(), lr=cfg.lr_actor, betas=(0.7, 0.95))
+        self.params = list(self.ctrl.parameters())
+        for p in self.params:  # each window's part of the gradient is the difference of the accumulated ones
+            p.grad = torch.zeros_like(p)
+        self.opt_a = torch.optim.Adam(self.params, lr=cfg.lr_actor, betas=(0.7, 0.95))
         self.opt_c = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr_critic, betas=(0.7, 0.95))
         self.iteration, self.lr_scale, self.best = 0, 1.0, math.inf
         self.best_ctrl = None  # the kept policy's weights, for the final scoring
@@ -268,21 +278,36 @@ class Trainer:
         return out
 
     # ---- updates ----------------------------------------------------------------------------------------------
-    def actor_step(self, frac: float, losses: list[float]) -> tuple[float, float, bool]:
-        """Clips and steps. Returns the pre-clip norm, the clip it was held to and whether a step was taken (not when
-        a loss or the norm is non-finite or huge). The relative clip starts after 5 steps."""
+    def clip_limit(self) -> float:
+        """``clip``, or clip_rel x the median of the recent pre-clip norms when lower (after 5 steps)."""
         cfg = self.cfg
-        limit = cfg.clip
         if cfg.clip_rel > 0.0 and len(self.norms) >= 5:
-            limit = min(limit, cfg.clip_rel * float(np.median(self.norms)))
-        norm = float(torch.nn.utils.clip_grad_norm_(self.ctrl.parameters(), limit))
-        if not math.isfinite(norm) or norm > 1e6 or not all(map(math.isfinite, losses)):
-            return norm, limit, False
+            return min(cfg.clip, cfg.clip_rel * float(np.median(self.norms)))
+        return cfg.clip
+
+    def bound(self, before: list, cap: float, finite_loss: bool) -> tuple[float, bool]:
+        """Holds the gradient one window added (the gradient now minus ``before``) to norm ``cap``, or takes it back
+        when it or the window's loss is non-finite or its norm exceeds drop_rel x cap. Returns its norm and whether
+        it was kept."""
+        delta = [p.grad - g for p, g in zip(self.params, before)]
+        norm = float(torch.linalg.vector_norm(torch.stack([torch.linalg.vector_norm(x) for x in delta])))
+        if finite_loss and norm <= cap:  # False for a NaN norm
+            return norm, True
+        keep = finite_loss and norm <= self.cfg.drop_rel * cap
+        with torch.no_grad():
+            for p, g, x in zip(self.params, before, delta):
+                p.grad.copy_(g + (cap / norm) * x if keep else g)
+        return norm, keep
+
+    def actor_step(self, frac: float, limit: float) -> float:
+        """Clips the summed gradient to ``limit`` and steps; returns its pre-clip norm."""
+        cfg = self.cfg
+        norm = float(torch.nn.utils.clip_grad_norm_(self.params, limit))
         self.norms.append(norm)
         for g in self.opt_a.param_groups:
             g["lr"] = cfg.lr_actor * self.lr_scale * max(1.0 - frac, 0.01)
         self.opt_a.step()
-        return norm, limit, True
+        return norm
 
     def critic_step(self, data: list[dict], frac: float) -> tuple[float, float]:
         """Fits the critic; returns its mean loss and the mean TD(lambda) target."""
@@ -376,7 +401,7 @@ class Trainer:
         log(f"[train] burn-in of {len(self.buildings)} building(s): {time.time() - t0:.0f}s")
         budget = cfg.minutes * 60.0
         t_start, t_ckpt, t_eval = time.time(), time.time(), time.time()
-        bad, best_ema, snap, cooldown, rollbacks = 0, -math.inf, None, 0, 0
+        best_ema, snap, cooldown, rollbacks, dropped, skipped = -math.inf, None, 0, 0, 0, 0
         ema: dict[int, float] = {}  # per building: moving average of its training reward (rewards are negative)
         n_pick = cfg.per_update if 0 < cfg.per_update < len(self.buildings) else len(self.buildings)
         with open(out / "train_log.jsonl", "a") as flog:
@@ -390,40 +415,42 @@ class Trainer:
                 picked = sorted(self.rng.choice(len(self.buildings), n_pick, replace=False).tolist())
                 chosen = [self.buildings[i] for i in picked]
                 n_scen = sum(b.S for b in chosen)
-                data, losses, rewards, ons = [], [], [], []
-                for b in chosen:
-                    d = self.window(b, b.S / n_scen)  # each scenario counts equally, as in the score
-                    data.append(d)
-                    losses.append(float(d["loss"]))
-                    rewards.append(float(d["reward"]))
-                    ons.append(float(d["on"]))
-                norm, limit, stepped = self.actor_step(frac, losses)
-                if not stepped:
-                    bad += 1
-                    self.lr_scale *= 0.5
-                    log(f"[train] iteration {self.iteration}: bad gradient (norm {norm:.3g}, losses {losses}); "
-                        f"step skipped, lr scale {self.lr_scale}")
-                    # Rows with finite states move on, so the next window differs (a fresh burn-in with the same
-                    # policy would replay the same window); rows with non-finite states start afresh.
-                    for b, d in zip(chosen, data):
-                        end = [*d["end"]["state"].values(), d["end"]["obs"], d["end"]["I"]]
-                        if all(bool(torch.isfinite(v).all()) for v in end):
-                            b.start = d["end"]
-                        else:
-                            self.burn_in(b)
-                    if bad >= 3:
-                        report["stopped"] = "three bad gradients in a row"
-                        break
+                limit = self.clip_limit()
+                kept, data, seen, w_norms = [], [], [], []  # seen: (building, loss, reward, on) of finite windows
+                for i, b in zip(picked, chosen):
+                    weight = b.S / n_scen  # each scenario counts equally, as in the score
+                    before = [p.grad.clone() for p in self.params]
+                    d = self.window(b, weight)
+                    loss = float(d["loss"])
+                    w_norm, ok = self.bound(before, limit * weight, math.isfinite(loss))
+                    w_norms.append(w_norm)
+                    if math.isfinite(loss):
+                        seen.append((i, loss, float(d["reward"]), float(d["on"])))
+                    if ok:
+                        kept.append(i)
+                        data.append(d)
+                    else:
+                        dropped += 1
+                        log(f"[train] it {self.iteration + 1}: {b.labels[0].split('__')[0]} window gradient "
+                            f"{w_norm:.3g} (cap {limit * weight:.3g}, loss {loss:.4g}) dropped")
+                    # Rows with finite states move on (a fresh burn-in with the same policy would replay the same
+                    # window); rows with non-finite states start afresh.
+                    end = [*d["end"]["state"].values(), d["end"]["obs"], d["end"]["I"]]
+                    if all(bool(torch.isfinite(v).all()) for v in end):
+                        b.start = d["end"]
+                    else:
+                        self.burn_in(b)
+                if not kept:
+                    skipped += 1
+                    log(f"[train] it {self.iteration + 1}: every window dropped, no step")
                     continue
-                bad = 0
-                for b, d in zip(chosen, data):
-                    b.start = d["end"]
+                norm = self.actor_step(frac, limit)
                 c_loss, g_mean = self.critic_step(data, frac)
                 self.iteration += 1
                 # Collapse guard on the mean over buildings of their reward averages (with every building in every
                 # iteration: the moving average of the mean training reward). It waits until every building has an
                 # average, so a mean over a few buildings never becomes the best the full mean is held to.
-                for i, r in zip(picked, rewards):
+                for i, _, r, _ in seen:
                     ema[i] = r if i not in ema else 0.9 * ema[i] + 0.1 * r
                 avg = float(np.mean(list(ema.values())))
                 if cooldown > 0:
@@ -439,11 +466,12 @@ class Trainer:
                     log(f"[train] it {self.iteration}: reward average {avg:.5f} vs best {best_ema:.5f}: collapse, "
                         f"networks restored to that best, lr scale {self.lr_scale}")
                     ema, cooldown = {}, 10
-                row = {"it": self.iteration, "min": elapsed / 60.0, "loss": float(np.mean(losses)),
-                       "reward": float(np.mean(rewards)), "grad_norm": norm, "clip": limit, "critic_loss": c_loss,
-                       "td_target_mean": g_mean,
+                row = {"it": self.iteration, "min": elapsed / 60.0, "loss": float(np.mean([x[1] for x in seen])),
+                       "reward": float(np.mean([x[2] for x in seen])), "grad_norm": norm, "clip": limit,
+                       "critic_loss": c_loss, "td_target_mean": g_mean,
                        "kp": float(torch.exp(self.ctrl.log_kp.detach())), "ki": float(torch.exp(self.ctrl.log_ki.detach())),
-                       "on_frac": float(np.mean(ons)), "rollbacks": rollbacks, "buildings": picked,
+                       "on_frac": float(np.mean([x[3] for x in seen])), "rollbacks": rollbacks, "buildings": picked,
+                       "window_norms": w_norms, "dropped": dropped,
                        "s": time.time() - t_it,
                        "env_steps_per_s": sum(b.rows for b in chosen) * cfg.h / (time.time() - t_it),
                        "mem_gb": torch.cuda.max_memory_allocated() / 2 ** 30 if self.device.startswith("cuda") else 0}
@@ -453,7 +481,7 @@ class Trainer:
                     log(f"[train] it {row['it']} {row['min']:.1f} min: reward {row['reward']:.5f} loss {row['loss']:.5f} "
                         f"grad {norm:.3g} (clip {limit:.3g}) critic {c_loss:.3g} G {g_mean:.3f} on {row['on_frac']:.2f} "
                         f"Kp {row['kp']:.3f} Ki {row['ki']:.4f} | {row['s']:.2f} s/it {row['env_steps_per_s']:,.0f} env-steps/s "
-                        f"{row['mem_gb']:.1f} GB")
+                        f"{row['mem_gb']:.1f} GB | {dropped} windows dropped")
                 if time.time() - t_eval >= cfg.eval_minutes * 60.0:
                     self._eval_and_keep(report, elapsed)
                     t_eval = time.time()
@@ -463,7 +491,8 @@ class Trainer:
         elapsed = time.time() - t_start + self.minutes_done * 60.0
         self._eval_and_keep(report, elapsed)
         self.save(out / "last.pt", elapsed / 60.0)
-        report.update(iterations=self.iteration, minutes=elapsed / 60.0, best=self.best, rollbacks=rollbacks)
+        report.update(iterations=self.iteration, minutes=elapsed / 60.0, best=self.best, rollbacks=rollbacks,
+                      dropped=dropped, skipped=skipped)
         if self.best_ctrl is not None and self.val:  # the kept policy on every held-out scenario
             self.ctrl.load_state_dict(self.best_ctrl)
             report["kept"] = self.evaluate(self.val, cfg.eval_steps)
