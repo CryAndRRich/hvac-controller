@@ -30,10 +30,11 @@ plain and seeds >= 1 with observation noise of evaluate.SIGMA, on the held-out s
 ``select`` (``--val-caches``; all held-out ones when empty, the training ones when there are none). The best policy
 by their mean is kept (``d1_policy.pt``, the file policy.KagglePolicy loads); at the end it is scored on every
 held-out scenario. Guards: a non-finite or huge gradient skips the step and halves the learning rate (three in a row
-stop the run), non-finite states restart the rows; a collapse (the mean over buildings of the moving average of each
-one's training reward 50 % worse than its best) restores the networks and optimisers saved at that best and halves
-the learning rate; the time budget ends the run cleanly, ``last.pt`` is written every 15 minutes and ``--resume``
-continues from it.
+stop the run), the rows move on, and those with non-finite states restart; a collapse (the mean over buildings of the
+moving average of each one's training reward 50 % worse than its best) restores the networks and optimisers saved at
+that best and halves the learning rate; the time budget ends the run cleanly, ``last.pt`` is written every 15
+minutes and ``--resume`` continues from it; out of GPU memory, the process restarts itself with half the row budget,
+from ``last.pt`` when there is one.
 """
 
 from __future__ import annotations
@@ -43,7 +44,9 @@ import collections
 import copy
 import json
 import math
+import os
 import pickle
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -347,7 +350,8 @@ class Trainer:
         torch.save({"cfg": asdict(self.cfg), "ctrl": self.ctrl.state_dict(), "ctrl_config": self.ctrl.config,
                     "critic": self.critic.state_dict(), "target": self.target.state_dict(),
                     "opt_a": self.opt_a.state_dict(), "opt_c": self.opt_c.state_dict(), "iteration": self.iteration,
-                    "lr_scale": self.lr_scale, "best": self.best, "minutes": minutes}, path)
+                    "lr_scale": self.lr_scale, "best": self.best, "best_ctrl": self.best_ctrl,
+                    "norms": list(self.norms), "minutes": minutes}, path)
 
     def load(self, path: Path) -> None:
         ck = torch.load(path, map_location=self.device)
@@ -357,6 +361,8 @@ class Trainer:
         self.opt_a.load_state_dict(ck["opt_a"])
         self.opt_c.load_state_dict(ck["opt_c"])
         self.iteration, self.lr_scale, self.best = ck["iteration"], ck["lr_scale"], ck["best"]
+        self.best_ctrl = ck["best_ctrl"]
+        self.norms.extend(ck["norms"])
         self.minutes_done = ck["minutes"]
 
     # ---- the loop ---------------------------------------------------------------------------------------------
@@ -397,8 +403,14 @@ class Trainer:
                     self.lr_scale *= 0.5
                     log(f"[train] iteration {self.iteration}: bad gradient (norm {norm:.3g}, losses {losses}); "
                         f"step skipped, lr scale {self.lr_scale}")
-                    for b in chosen:  # the rows may carry non-finite states: start them afresh
-                        self.burn_in(b)
+                    # Rows with finite states move on, so the next window differs (a fresh burn-in with the same
+                    # policy would replay the same window); rows with non-finite states start afresh.
+                    for b, d in zip(chosen, data):
+                        end = [*d["end"]["state"].values(), d["end"]["obs"], d["end"]["I"]]
+                        if all(bool(torch.isfinite(v).all()) for v in end):
+                            b.start = d["end"]
+                        else:
+                            self.burn_in(b)
                     if bad >= 3:
                         report["stopped"] = "three bad gradients in a row"
                         break
@@ -409,12 +421,15 @@ class Trainer:
                 c_loss, g_mean = self.critic_step(data, frac)
                 self.iteration += 1
                 # Collapse guard on the mean over buildings of their reward averages (with every building in every
-                # iteration: the moving average of the mean training reward).
+                # iteration: the moving average of the mean training reward). It waits until every building has an
+                # average, so a mean over a few buildings never becomes the best the full mean is held to.
                 for i, r in zip(picked, rewards):
                     ema[i] = r if i not in ema else 0.9 * ema[i] + 0.1 * r
                 avg = float(np.mean(list(ema.values())))
                 if cooldown > 0:
                     cooldown -= 1
+                elif len(ema) < len(self.buildings):
+                    pass
                 elif avg > best_ema:
                     best_ema, snap = avg, self._snapshot()
                 elif self.iteration > 20 and avg < 1.5 * best_ema and snap is not None:
@@ -553,29 +568,34 @@ def main() -> None:
               "device_name": torch.cuda.get_device_name() if device == "cuda" else "cpu", "torch": torch.__version__}
     (out / "config.json").write_text(json.dumps(report, indent=1))
     t0 = time.time()
-    for attempt in range(4):  # out of memory at start-up: halve the rows
-        try:
-            buildings = load_buildings(caches, cfg.row_budget, cfg.h, device)
-            val = load_buildings(val_caches, 0, cfg.h, device)
-            trainer = Trainer(cfg, buildings, val, device, out, log)
-            if a.resume:
-                trainer.load(a.resume)
-            log(f"[train] {len(buildings)} building(s): " + "; ".join(
-                f"{'/'.join(b.labels)} V={b.lay['V']} A={b.lay['A']} rows={b.rows} sweeps={b.env.rom.sweeps}"
-                for b in buildings) + f" | setup {time.time() - t0:.0f}s")
-            if a.smoke:
-                report["parity"] = parity_check(trainer.ctrl, buildings[0].reps[0], device, 36, out / "smoke_policy.pt")
-                log(f"[smoke] parity: {report['parity']}")
-                report["eval_288"] = trainer.evaluate(trainer.scored, 288)
-                log(f"[smoke] replica eval over 288 steps: {report['eval_288']['key']:.5f}")
-            report.update(trainer.train())
-            break
-        except torch.cuda.OutOfMemoryError:
-            cfg.row_budget //= 2
-            report.setdefault("oom_halvings", []).append(cfg.row_budget)
-            log(f"[train] out of memory: row budget -> {cfg.row_budget}")
-            buildings = val = trainer = None
-            torch.cuda.empty_cache()
+    try:
+        buildings = load_buildings(caches, cfg.row_budget, cfg.h, device)
+        val = load_buildings(val_caches, 0, cfg.h, device)
+        trainer = Trainer(cfg, buildings, val, device, out, log)
+        if a.resume:
+            trainer.load(a.resume)
+        held = torch.cuda.memory_allocated() / 2 ** 30 if device == "cuda" else 0.0
+        log(f"[train] {len(buildings)} building(s): " + "; ".join(
+            f"{'/'.join(b.labels)} V={b.lay['V']} A={b.lay['A']} rows={b.rows} sweeps={b.env.rom.sweeps}"
+            for b in buildings) + f" | setup {time.time() - t0:.0f}s, {held:.2f} GB held")
+        if a.smoke:
+            # The organisers' simulator needs the scenario's config.gin; generated scenarios come as caches only.
+            rep = next(r for b in buildings for r in b.reps if Path(r["info"]["config"]).exists())
+            report["parity"] = parity_check(trainer.ctrl, rep, device, 36, out / "smoke_policy.pt")
+            log(f"[smoke] parity on {rep['info']['label']}: {report['parity']}")
+            report["eval_288"] = trainer.evaluate(trainer.scored, 288)
+            log(f"[smoke] replica eval over 288 steps: {report['eval_288']['key']:.5f}")
+        report.update(trainer.train())
+    except torch.cuda.OutOfMemoryError:
+        # A retry in the same process keeps the failed attempt's memory (V2, 2026-10-22): start afresh with half the
+        # rows, from the last checkpoint when there is one.
+        if cfg.row_budget < 200_000:
+            raise
+        log(f"[train] out of memory: restarting with row budget {cfg.row_budget // 2}")
+        argv = [*sys.argv[1:], "--row-budget", str(cfg.row_budget // 2)]
+        if (out / "last.pt").exists():
+            argv += ["--resume", str(out / "last.pt")]
+        os.execv(sys.executable, [sys.executable, "-m", "hvac_controller.d1.train", *argv])
     report["seconds"] = time.time() - t0
     (out / "report.json").write_text(json.dumps(report, indent=1, default=str))
     log(f"[train] done: best replica score {report.get('best')} after {report.get('iterations')} iterations")
