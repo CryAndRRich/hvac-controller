@@ -63,6 +63,10 @@ def make_policy(name: str, meta: dict, action_spec, spec, seed: int, cache: str 
         from hvac_controller.d2.mpc import make_mpc
 
         policy = make_mpc(name[3:], meta, action_spec, cache)
+    elif name.startswith("d2s:"):
+        from hvac_controller.d2.student import StudentPolicy
+
+        policy = StudentPolicy(meta, action_spec, name[4:])
     elif name == "k10":
         from hvac_controller.baseline_k10 import SubmissionPolicy
 
@@ -76,7 +80,7 @@ def make_policy(name: str, meta: dict, action_spec, spec, seed: int, cache: str 
         spec_file.loader.exec_module(module)
         policy = module.KagglePolicy(meta, action_spec, weights=d / "d1_policy.pt")
     else:
-        raise ValueError(f"unknown policy {name!r}: k10, pkg:<dir> or d2:<mpc config>")
+        raise ValueError(f"unknown policy {name!r}: k10, pkg:<dir>, d2:<mpc config> or d2s:<student weights>")
     return policy if seed == 0 else NoisyPolicy(policy, obs_noise_mask(spec), SIGMA, seed)
 
 
@@ -163,6 +167,8 @@ def run_replica(cache: str, policy: str, seed: int, n_steps: int) -> dict:
 def policy_tag(name: str) -> str:
     if name.startswith("pkg:"):
         return Path(name.split(":", 1)[1]).name
+    if name.startswith("d2s:"):
+        return "d2s-" + Path(name[4:]).stem
     return name.replace(":", "-")
 
 

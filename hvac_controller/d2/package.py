@@ -19,12 +19,14 @@ ROOT = Path(__file__).resolve().parents[2]
 FILES = ["hvac_controller/__init__.py", "hvac_controller/sim.py", "hvac_controller/baseline_k10.py",
          *[f"hvac_controller/d1/{m}.py" for m in ("__init__", "core", "rom", "plant", "spec", "torch_env", "ops",
                                                   "policy", "cache")],
-         *[f"hvac_controller/d2/{m}.py" for m in ("__init__", "lowlevel", "mpc", "build", "submission")]]
+         *[f"hvac_controller/d2/{m}.py" for m in ("__init__", "lowlevel", "mpc", "build", "submission", "lp",
+                                                  "features", "student")]]
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("out", type=Path)
+    ap.add_argument("--weights", type=Path, nargs="*", default=[], help="student weights to ship alongside")
     a = ap.parse_args()
     commit = subprocess.run(["git", "-C", str(ROOT), "log", "-1", "--format=%h %s"], capture_output=True,
                             text=True).stdout.strip()
@@ -33,6 +35,8 @@ def main() -> None:
     with zipfile.ZipFile(a.out, "w", zipfile.ZIP_DEFLATED) as z:
         for f in FILES:
             z.write(ROOT / f, f)
+        for w in a.weights:
+            z.write(w, f"weights/{w.name}")
         z.writestr("README.txt", f"hvac_controller (direction 2 MPC) at {commit}{' + uncommitted changes' if dirty else ''}\n")
     print(f"wrote {a.out} ({len(FILES)} files) from {commit}{' (dirty)' if dirty else ''}")
 

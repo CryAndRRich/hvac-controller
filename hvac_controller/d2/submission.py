@@ -41,7 +41,13 @@ class D2Policy:
         t0 = self.t_start = time.time()
         self.steps, self.policy_s = 0, 0.0
         try:
-            self.mpc = make_mpc(config, building_meta_data, action_spec, None)
+            if config.startswith("d2s:"):  # the distilled student: no model, no planning
+                from hvac_controller.d2.student import StudentPolicy
+
+                self.mpc = StudentPolicy(building_meta_data, action_spec, config[4:])
+                self.mpc.meta, self.mpc.stats = building_meta_data, {"plan_s": 0.0}
+            else:
+                self.mpc = make_mpc(config, building_meta_data, action_spec, None)
         except Exception:
             traceback.print_exc(file=sys.stdout)
             self._fall_back(building_meta_data)
