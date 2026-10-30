@@ -104,16 +104,20 @@ class LowLevel:
         v = dec[:, self.cols[name]]
         return v if v.shape[1] == self.A else np.broadcast_to(v, (dec.shape[0], self.A))
 
-    def act(self, obs: np.ndarray, integral: np.ndarray, dec: np.ndarray):
-        """obs (B, n_obs), PI integrals (B, V), decisions (B, 6) in [0, 1] -> continuous (B, n_cont) and discrete
-        (B, n_disc) actions, integrals'."""
+    def act(self, obs: np.ndarray, integral: np.ndarray, dec: np.ndarray, bands=None):
+        """obs (B, n_obs), PI integrals (B, n_int), decisions (B, n_dec) in [0, 1] -> continuous (B, n_cont) and
+        discrete (B, n_disc) actions, integrals'. ``bands``: (heat_to, cool_to), each (B, V) in kelvin and VAV
+        order of the layout: per-zone targets of the two loops (needs ``deadband`` > 0); the target decision is then
+        unused."""
         B, A, dt = obs.shape[0], self.A, self.dtype
         dec = dec.astype(dt, copy=False)
         run_a = (self._per_ahu(dec, "run") > 0.5).astype(dt)  # (B, A)
         run = run_a[:, self.vav_ahu]  # (B, V): each zone follows its AHU
         b_lo, b_hi = self.band
         target = b_lo + (b_hi - b_lo) * self._per_ahu(dec, "target")[:, self.vav_ahu]
-        if self.deadband > 0.0:
+        if bands is not None:
+            damper, valve, integral = self._two_loops(self.zone_temps(obs), None, integral, run, bands)
+        elif self.deadband > 0.0:
             damper, valve, integral = self._two_loops(self.zone_temps(obs), target, integral, run)
         else:
             damper, valve, integral = self._one_loop(self.zone_temps(obs) - target, integral, run)
@@ -155,11 +159,15 @@ class LowLevel:
         integral = np.where(stuck, integral, np.clip(integral + err, 0.0, 1.0 / self.ki)) * run
         return np.clip(self.kp * err + self.ki * integral, 0.0, 1.0) * run, integral
 
-    def _two_loops(self, temps, target, integral, run):
-        """Cooling towards the target, heating towards the band floor + deadband, floating in between."""
+    def _two_loops(self, temps, target, integral, run, bands=None):
+        """Cooling towards the target, heating towards the band floor + deadband, floating in between; or towards
+        the given per-zone ``bands`` (heat_to, cool_to)."""
         V = self.V
-        t_heat = self.band[0] + self.deadband
-        cool, i_cool = self._pi_up(temps - np.maximum(target, t_heat + 0.3), integral[:, :V], run)
+        if bands is None:
+            t_heat, t_cool = self.band[0] + self.deadband, np.maximum(target, self.band[0] + self.deadband + 0.3)
+        else:
+            t_heat, t_cool = bands
+        cool, i_cool = self._pi_up(temps - t_cool, integral[:, :V], run)
         heat, i_heat = self._pi_up(t_heat - temps, integral[:, V:], run)
         damper, valve = self._sequenced(heat, cool)
         return damper, valve, np.concatenate([i_cool, i_heat], 1)

@@ -118,14 +118,19 @@ def run_original(config: str, policy: str, seed: int, n_steps: int, cache: str |
         rewards.append(float(reward))
         if terminated or truncated:
             break
-    out = _summary(rewards, terms, time.time() - t0, policy_s)
-    stats = getattr(pol, "stats", None)  # MPC: replans, planning seconds, model gain over its default plan
+    return _with_stats(_summary(rewards, terms, time.time() - t0, policy_s), pol)
+
+
+def _with_stats(out: dict, pol) -> dict:
+    """The summary plus an MPC policy's own counters (replans, planning seconds, ...), when it has them."""
+    stats = getattr(pol, "stats", None)
     if stats:
         gain, err = np.asarray(stats["gain"]), np.asarray(stats.get("obs_err", []))
         out["mpc"] = {"replans": stats["replans"], "plan_s": stats["plan_s"],
                       "gain_mean": float(gain.mean()) if gain.size else 0.0,
                       "obs_err_k": float(err.mean()) if err.size else 0.0, "guard": stats.get("guard", 0),
-                      "skipped": stats.get("skipped", 0)}
+                      "skipped": stats.get("skipped", 0), "lp_failed": stats.get("lp_failed", 0),
+                      "sel": stats.get("sel"), "mm_err": stats.get("mm_err"), "switches": stats.get("switches")}
     return out
 
 
@@ -152,7 +157,7 @@ def run_replica(cache: str, policy: str, seed: int, n_steps: int) -> dict:
         post = info["post"]
         rewards.append(float(reward[0]))
         terms.append((post["regret"][0], post["norm_cost"][0], post["norm_carbon"][0]))
-    return _summary(rewards, terms, time.time() - t0, policy_s)
+    return _with_stats(_summary(rewards, terms, time.time() - t0, policy_s), pol)
 
 
 def policy_tag(name: str) -> str:

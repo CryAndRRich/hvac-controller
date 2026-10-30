@@ -49,6 +49,22 @@ def prior_materials() -> dict[str, float]:
             for name, (lo, hi, scale) in PROPERTIES.items()}
 
 
+def candidate_materials(n: int) -> list[dict[str, float]]:
+    """The prior first, then constructions spanning the property that moves a building most: the facade's
+    conductivity at the quartiles of its range (n = 3), and the envelope's density at its quartiles too (n = 5)."""
+    from smart_buildings.smart_control.utils.materials import PROPERTIES
+
+    def quantile(name, q):
+        lo, hi, _ = PROPERTIES[name]
+        return float(np.exp(np.log(lo) + q * (np.log(hi) - np.log(lo))))
+
+    out = [prior_materials()]
+    for name in ("exterior_cv_conductivity", "exterior_cv_density")[:max(0, (n - 1) // 2)]:
+        for q in (0.25, 0.75):
+            out.append(dict(out[0], **{name: quantile(name, q)}))
+    return out[:max(n, 1)]
+
+
 def _key(meta: dict, materials: dict, h: float) -> str:
     m = hashlib.sha1()
     m.update(np.ascontiguousarray(meta["floor_plan"]).tobytes())
