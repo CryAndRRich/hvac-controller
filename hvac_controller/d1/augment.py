@@ -26,6 +26,17 @@ generated buildings, each paired with strips of stations drawn by climate:
 ``manifest`` picks the seeds and the strips and writes the list (deterministic), ``buildings`` the building YAMLs, and
 ``scenarios`` the weather presets and scenario folders of a shard of it. Run from the repository root: the generator
 writes repo-relative paths.
+
+``stress`` writes a test set built like the hidden one (each of a few held-out buildings at 5 stations no scenario
+uses) from the harshest 30-day strips instead of random ones. V3 beat V1 on all 17 held-out scenarios in the original
+yet lost on the LB (0.01274 vs 0.00857), and the gateway names hidden scenarios after a city and a month
+(``riyadh_jul``), so extreme months are the first suspect. Usable stations as above; for each, the Sunday 06:00 start
+(weeks 0-47) whose 30 days are the most extreme by: ``hot`` the mean temperature, ``cold`` its negative,
+``diurnal`` the mean daily range, ``variable`` the spread of the daily means, ``warm_night`` the mean daily minimum
+(no night to pre-cool in). The very top is beyond any plausible test city (a 41 C month in Kuwait, a -43 C month in
+Yakutia: every policy fails there alike), so the buildings form a severity ladder: building i takes, in every
+category, the station ranked at the SEVERITY[i] quantile (or the next one down whose station and country are still
+unused), and no station is used twice.
 """
 
 from __future__ import annotations
@@ -54,17 +65,25 @@ PER_TRAIN, PER_VAL = 3, 2
 VAL_SHIPPED = (("building_train_2", "minneapolis_1"), ("building_train_2", "minneapolis_5"))
 TAGS = ("gen_train", "gen_val", "shipped_building_new_station")
 MEAN_RANGE = (-10.0, 30.0)  # annual mean temperature of usable stations, C, [lo, hi)
+STRESS = ("hot", "cold", "diurnal", "variable", "warm_night")
+SEVERITY = (0.995, 0.98, 0.95, 0.9, 0.75)  # quantile of each stress building's stations in every category
+DAYS = 30
 
 
 def held_out_station(stem: str) -> bool:
     return int(hashlib.sha256(stem.encode()).hexdigest()[:8], 16) % 10 == 0
 
 
+def usable(table: dict) -> list[dict]:
+    """Stations with an annual mean in MEAN_RANGE, outside the shipped six and Antarctica."""
+    shipped = set(weather.SHIPPED_STEMS.values())
+    return [r for r in table.values() if MEAN_RANGE[0] <= float(r["temp_mean"]) < MEAN_RANGE[1]
+            and r["stem"] not in shipped and r["country"] != "ATA"]
+
+
 def climate_cells(table: dict) -> tuple[dict, dict]:
     """Usable stations by climate cell (mean temperature bin, range tertile), for training and held out."""
-    shipped = set(weather.SHIPPED_STEMS.values())
-    rows = [r for r in table.values() if MEAN_RANGE[0] <= float(r["temp_mean"]) < MEAN_RANGE[1]
-            and r["stem"] not in shipped and r["country"] != "ATA"]
+    rows = usable(table)
     spans = np.array([float(r["temp_max"]) - float(r["temp_min"]) for r in rows])
     edges = np.quantile(spans, [1 / 3, 2 / 3])
     train, val = {}, {}
@@ -150,6 +169,46 @@ def pick_strips(table: dict, train_seeds: list[int], val_seeds: list[int], seed:
     return out
 
 
+def window_extremes(temp: np.ndarray) -> dict[str, tuple[float, int]]:
+    """Per STRESS category, the most extreme value over the 30-day strips from Sunday 06:00 of weeks 0-47 of an
+    hourly year (2023-01-01 is a Sunday) and the week it starts; every category is "higher is harsher"."""
+    days = np.stack([temp[6 + 168 * w: 6 + 168 * w + 24 * DAYS].reshape(DAYS, 24) for w in range(48)])
+    daily = days.mean(2)
+    scores = {"hot": daily.mean(1), "cold": -daily.mean(1), "diurnal": np.ptp(days, axis=2).mean(1),
+              "variable": daily.std(1), "warm_night": days.min(2).mean(1)}
+    return {c: (float(s.max()), int(s.argmax())) for c, s in scores.items()}
+
+
+def stress_strips(pk: weather.Packed, buildings: list[str]) -> list[dict]:
+    """The stress manifest: every building at the harshest strip of each STRESS category (module docstring)."""
+    rows = sorted(usable(pk.table), key=lambda r: (int(r["shard"]), int(r["idx"])))  # one shard read at a time
+    ext = {r["stem"]: window_extremes(pk.x100(r["stem"])[:, 0] / 100.0) for r in rows}
+    if len(buildings) > len(SEVERITY):
+        raise ValueError(f"at most {len(SEVERITY)} stress buildings")
+    country = {r["stem"]: r["country"] for r in rows}
+    used, picks = set(), {}
+    for c in STRESS:
+        ranked = sorted(ext, key=lambda s: (-ext[s][c][0], s))
+        seen, picks[c] = set(), []
+        for q in SEVERITY[:len(buildings)]:
+            stem = next(s for s in ranked[int((1.0 - q) * len(ranked)):] if s not in used and country[s] not in seen)
+            picks[c].append(stem)
+            used.add(stem)
+            seen.add(country[stem])
+    out = []
+    for i, b in enumerate(buildings):
+        for c in STRESS:
+            stem = picks[c][i]
+            value, week = ext[stem][c]
+            start = np.datetime64("2023-01-01T06:00") + np.timedelta64(7 * week, "D")
+            out.append({"building": b, "stem": stem, "start": str(start).replace("T", " ")[:16],
+                        "h": round(weather.estimate_h(float(pk.table[stem]["wind_mean_ms"])), 1), "tag": "stress",
+                        "category": c, "extreme": round(value, 2), "weather": f"s{len(out):03d}"})
+    for e in out:
+        e["label"] = f"{e['building']}__{e['weather']}"
+    return out
+
+
 def make_buildings(entries: list[dict], out_dir: Path) -> list[Path]:
     """The manifest's generated buildings' YAMLs (the training and held-out seed lists, one call each)."""
     paths = []
@@ -195,6 +254,10 @@ def main() -> None:
     m.add_argument("out", type=Path)
     m.add_argument("--packed", type=Path, required=True, help="the packed TMYx data (folder or weathertmyx.zip)")
     m.add_argument("--seed", type=int, default=0)
+    st = sub.add_parser("stress")
+    st.add_argument("out", type=Path)
+    st.add_argument("--packed", type=Path, required=True)
+    st.add_argument("--buildings", required=True, help="comma-separated building names (their YAMLs must exist)")
     bl = sub.add_parser("buildings")
     bl.add_argument("manifest", type=Path)
     s = sub.add_parser("scenarios")
@@ -212,6 +275,14 @@ def main() -> None:
         entries = pick_strips(pk.table, valid_seeds(TRAIN_FROM, N_TRAIN), valid_seeds(VAL_FROM, N_VAL), a.seed)
         a.out.write_text(json.dumps(entries, indent=1))
         print(_summary(entries, pk.table))
+    elif a.cmd == "stress":
+        pk = weather.Packed(a.packed)
+        entries = stress_strips(pk, a.buildings.split(","))
+        a.out.write_text(json.dumps(entries, indent=1))
+        for e in entries:
+            r = pk.table[e["stem"]]
+            print(f"{e['label']} {e['category']:10s} {e['extreme']:7.2f} {e['start']} h {e['h']:4.1f} {e['stem']} "
+                  f"(annual mean {float(r['temp_mean']):.1f} C)")
     elif a.cmd == "buildings":
         paths = make_buildings(json.loads(a.manifest.read_text()), Path("smart_buildings/buildings"))
         print(f"{len(paths)} building YAMLs")
