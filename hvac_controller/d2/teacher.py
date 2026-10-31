@@ -102,7 +102,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("out_dir", type=Path)
     ap.add_argument("--caches", type=Path, required=True, help="folder of <building>__<weather>.pkl caches")
-    ap.add_argument("--manifest", type=Path, help="manifest_v2.json: take the scenarios with --tags")
+    ap.add_argument("--manifest", type=Path, help="manifest_v2.json: take the scenarios with --tags (default: every "
+                    "cache in --caches except the shipped buildings)")
     ap.add_argument("--tags", default="gen_train")
     ap.add_argument("--scenarios", default="", help="or: comma-separated <building>__<weather> labels")
     ap.add_argument("--policy", default="heavy.pa0.hs1")
@@ -116,9 +117,11 @@ def main() -> None:
     a = ap.parse_args()
     if a.scenarios:
         labels = a.scenarios.split(",")
-    else:
+    elif a.manifest and a.manifest.exists():
         tags = set(a.tags.split(","))
         labels = [e["label"] for e in json.loads(a.manifest.read_text()) if e.get("tag") in tags]
+    else:  # every cache in the folder, but never the shipped buildings: they are the evaluation set
+        labels = [q.stem for q in a.caches.glob("*.pkl") if not q.stem.startswith("building_train_")]
     labels = sorted(labels)[a.shard::a.shards]
     a.out_dir.mkdir(parents=True, exist_ok=True)
     jobs = []
