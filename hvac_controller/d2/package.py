@@ -20,7 +20,7 @@ FILES = ["hvac_controller/__init__.py", "hvac_controller/sim.py", "hvac_controll
          *[f"hvac_controller/d1/{m}.py" for m in ("__init__", "core", "rom", "plant", "spec", "torch_env", "ops",
                                                   "policy", "cache")],
          *[f"hvac_controller/d2/{m}.py" for m in ("__init__", "lowlevel", "mpc", "build", "submission", "lp",
-                                                  "features", "student")]]
+                                                  "features", "student", "rl")]]
 
 
 def main() -> None:

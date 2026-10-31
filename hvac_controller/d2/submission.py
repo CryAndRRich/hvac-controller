@@ -41,10 +41,13 @@ class D2Policy:
         t0 = self.t_start = time.time()
         self.steps, self.policy_s = 0, 0.0
         try:
-            if config.startswith("d2s:"):  # the distilled student: no model, no planning
-                from hvac_controller.d2.student import StudentPolicy
+            if config.startswith(("d2s:", "d2r:")):  # a learnt policy: no model, no planning
+                if config.startswith("d2s:"):
+                    from hvac_controller.d2.student import StudentPolicy as Learnt
+                else:
+                    from hvac_controller.d2.rl import RLPolicy as Learnt
 
-                self.mpc = StudentPolicy(building_meta_data, action_spec, config[4:])
+                self.mpc = Learnt(building_meta_data, action_spec, config[4:])
                 self.mpc.meta, self.mpc.stats = building_meta_data, {"plan_s": 0.0}
             else:
                 self.mpc = make_mpc(config, building_meta_data, action_spec, None)
