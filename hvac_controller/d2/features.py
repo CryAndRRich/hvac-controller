@@ -15,6 +15,9 @@ Groups (``NAMES`` lists them in order):
   comfort band; the share of zones outside it; their change over the last hour and six hours;
 - plant: the hot-water tank temperature;
 - building: size (log zones), air handlers per zone, floors.
+
+``local()`` gives the same kind of zone statistics per air handler, over the zones it serves (``LOCAL_NAMES``), for
+policies that decide per air handler; it is a (A, n) array whose length follows the building.
 """
 
 from __future__ import annotations
@@ -36,6 +39,8 @@ NAMES = (
     "log_zones", "ahus_per_zone", "floors",
 )
 N_FEATURES = len(NAMES)
+LOCAL_NAMES = ("a_mean", "a_min", "a_max", "a_margin_lo", "a_margin_hi", "a_share_out", "a_dt_1h", "a_zones")
+N_LOCAL = len(LOCAL_NAMES)
 STEPS_PER_HOUR = 12
 _EMA = {"oat_1h": 12, "oat_6h": 72, "oat_24h": 288}  # time constants in steps
 
@@ -53,6 +58,8 @@ class FeatureBuilder:
         self.lo, self.hi = (float(v) for v in meta["comfort_temp_window"])
         self.start_h, self.end_h = float(meta["morning_start_hour"]), float(meta["evening_start_hour"])
         V, A = lay.V, lay.A
+        self.vav_ahu = np.asarray(lay.vav_ahu)
+        self.ahu_members = [np.flatnonzero(self.vav_ahu == a) for a in range(A)]
         self.static = np.array([math.log(V) / 4.0, A / V * 5.0, float(meta.get("num_floors") or 1) / 4.0])
         self.reset()
 
@@ -100,6 +107,7 @@ class FeatureBuilder:
         self.oat_day.append(oat)
         self.temps.append(temps)
         t1 = self.temps[-13] if len(self.temps) > 12 else self.temps[0]
+        self._now, self._d1 = temps, temps - t1
         t6 = self.temps[0]
         d1 = temps - t1
         lo, hi = self.lo, self.hi
@@ -117,3 +125,15 @@ class FeatureBuilder:
             *self.static,
         ], dtype=np.float32)
         return f
+
+    def local(self) -> np.ndarray:
+        """(A, N_LOCAL) statistics of each air handler's zones, as of the last ``update``."""
+        temps, d1, lo, hi = self._now, self._d1, self.lo, self.hi
+        out = np.zeros((len(self.ahu_members), N_LOCAL), dtype=np.float32)
+        for a, idx in enumerate(self.ahu_members):
+            if len(idx) == 0:
+                continue
+            t = temps[idx]
+            out[a] = ((t.mean() - 295.5) / 2.0, (t.min() - 295.5) / 2.0, (t.max() - 295.5) / 2.0, t.min() - lo,
+                      hi - t.max(), float(((t < lo) | (t > hi)).mean()), d1[idx].mean(), len(idx) / 10.0)
+        return out

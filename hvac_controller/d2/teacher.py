@@ -10,8 +10,8 @@ recorded with the student's features (features.py) of that moment.
 - ``dagger``: a student (student.py) acts, the teacher only labels the states the student visits (DAgger). With
   probability ``beta`` per hour the teacher's decision is executed instead, which keeps the states near both.
 
-One ``.npz`` per scenario: features X (N, F), decisions Y (N, 6), step k (N,), the hour's reward R (N,), and the
-episode's score.
+One ``.npz`` per scenario: features X (N, F), per-air-handler features XL (N, A, F_local), decisions Y (N, 6), step k
+(N,), the hour's reward R (N,), and the episode's score.
 
     python -m hvac_controller.d2.teacher OUT_DIR --caches DIR --manifest manifest_v2.json --tags gen_train \\
         --policy heavy.pa0.hs1 --shard 0 --shards 4 --n-procs 4
@@ -56,7 +56,7 @@ def label_scenario(cache: str, out: str, policy: str, mode: str, student: str | 
     lo, hi = action_spec["continuous_action"].low, action_spec["continuous_action"].high
     obs = env.reset()
     integral = np.zeros((1, ll.n_int), dtype=np.float32)
-    X, Y, K, R = [], [], [], []
+    X, XL, Y, K, R = [], [], [], [], []
     total, hour_r, plan, own = 0.0, 0.0, None, True
     n = min(steps, env.n_steps)
     for k in range(n):
@@ -73,6 +73,7 @@ def label_scenario(cache: str, out: str, policy: str, mode: str, student: str | 
                 R.append(hour_r)
             hour_r = 0.0
             X.append(f)
+            XL.append(fb.local())
             Y.append(np.asarray(plan[0], dtype=np.float32))
             K.append(k)
             own = pupil is None or rng.random() < beta
@@ -86,7 +87,7 @@ def label_scenario(cache: str, out: str, policy: str, mode: str, student: str | 
         hour_r += float(reward[0])
     R.append(hour_r)
     score = abs(total) / n
-    np.savez_compressed(out, X=np.array(X), Y=np.array(Y), K=np.array(K), R=np.array(R), score=score)
+    np.savez_compressed(out, X=np.array(X), XL=np.array(XL), Y=np.array(Y), K=np.array(K), R=np.array(R), score=score)
     return {"cache": cache, "out": out, "score": score, "labels": len(X), "seconds": time.time() - t0}
 
 
